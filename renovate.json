@@ -3,5 +3,6 @@
   "extends": [
     "github>MichaBigler/renovate-config",
     "github>MichaBigler/renovate-config:auto-merge"
-  ]
+  ],
+  "baseBranches": ["main"]
 }
