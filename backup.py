@@ -276,7 +276,7 @@ def restic_repo_ready(env: Dict[str, str], repo_name: str) -> None:
         fail(f"{repo_name}: restic init failed")
 
 
-def run_restic(repo_url: Optional[str], repo_name: str) -> Tuple[bool, Optional[str]]:
+def run_restic(repo_url: Optional[str], repo_name: str, *, unlock_stale: bool = False) -> Tuple[bool, Optional[str]]:
     if not repo_url:
         log(f"{repo_name}: SKIP (no repo url)")
         return True, None
@@ -287,6 +287,18 @@ def run_restic(repo_url: Optional[str], repo_name: str) -> Tuple[bool, Optional[
     env = {"RESTIC_REPOSITORY": repo_url}
 
     restic_repo_ready(env, repo_name)
+
+    # Clear stale locks left by an interrupted prior run (the 2026-07-12
+    # contact-prod incident: a crashed restic left a lock that blocked
+    # `forget --prune` on every subsequent daily run for days — backups kept
+    # succeeding but retention was stuck). Gated to unlock_stale callers only:
+    # `restic unlock` also reaps locks by AGE (>30 min), not just by dead PID, so
+    # it is safe ONLY on the strictly per-host local repo. The B2 repo is NOT
+    # auto-unlocked — restore-cross-server.yml can legitimately hold a lock on it
+    # from a different host, which an age-based unlock could wrongly reap.
+    # Best-effort: a real repo problem surfaces on the backup/forget step below.
+    if unlock_stale:
+        run_cmd([RESTIC_BIN, "unlock"], env=env)
 
     backup_cmd = [
         RESTIC_BIN,
@@ -343,7 +355,7 @@ def main() -> None:
     generate_paths_file()
     perform_db_dumps()
 
-    ok_local, snap_local = run_restic(RESTIC_REPO_LOCAL, "Local")
+    ok_local, snap_local = run_restic(RESTIC_REPO_LOCAL, "Local", unlock_stale=True)
     ok_b2, snap_b2 = run_restic(RESTIC_REPO_B2, "B2")
 
     if not ok_local or not ok_b2:
