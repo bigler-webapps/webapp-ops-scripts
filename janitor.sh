@@ -6,8 +6,8 @@
 # but-unused images or the build cache, which is where disk actually fills up
 # (staging measured: 59.5 GB build cache, 51.83 GB reclaimable, 0% of it
 # "active"). Each prune below targets one of those buckets explicitly, with a
-# keep-storage FLOOR on the build cache so it doesn't grow unbounded again but
-# still keeps some warm-cache benefit across repeat builds on the same repo.
+# daily keep-storage FLOOR on the build cache so it doesn't grow unbounded
+# again but still keeps 20 GB of warm-cache benefit across repeat builds.
 # Volumes are deliberately EXCLUDED -- a detached-but-still-needed data volume
 # on a prod box is not worth the few GB reclaimed.
 
@@ -23,7 +23,7 @@ echo "== Docker image prune (tagged-unused images, untouched >48h) =="
 docker image prune -af --filter "until=48h" || true
 
 echo "== Docker builder prune (build cache, keep-storage floor) =="
-docker builder prune -af --keep-storage=5GB || true
+docker builder prune -af --keep-storage=20GB || true
 
 echo "== Disk usage (after) =="
 df -h /
