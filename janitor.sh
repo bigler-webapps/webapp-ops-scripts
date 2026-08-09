@@ -25,6 +25,12 @@ docker image prune -af --filter "until=48h" || true
 echo "== Docker builder prune (build cache, keep-storage floor) =="
 docker builder prune -af --keep-storage=20GB || true
 
+echo "== Docker storage diagnostic (verbose) =="
+docker system df -v || true
+
+echo "== Largest Docker/containerd top-level directories =="
+du -sh /var/lib/docker/*/ /var/lib/containerd/*/ 2>/dev/null | sort -rh | head -n 15 || true
+
 echo "== Disk usage (after) =="
 df -h /
 
