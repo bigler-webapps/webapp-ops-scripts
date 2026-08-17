@@ -2,10 +2,12 @@
 """
 verify_backup.py
 
-Verifies that the latest restic snapshot in the B2 repo contains fresh Postgres dumps
-and that every dump can be streamed from the repo and passes a gzip integrity test.
+Verifies that this host's own restic snapshot in the B2 repo contains fresh Postgres
+dumps and that every dump can be streamed from the repo and passes a gzip integrity test.
 
-- Picks the newest snapshot across restic "--latest 1" groups.
+- Verifies the exact snapshot backup.py's own run just created (via
+  LAST_B2_SNAPSHOT_ID_FILE); falls back to the newest snapshot tagged with this
+  host (--host <nodename>), by parsed instant, for ad-hoc/manual runs.
 - Filters *.sql.gz by a time window around the snapshot time (default: 2 hours).
 - Verifies ALL matching dumps (not just one) by piping `restic dump` -> `gzip -t`.
 
@@ -20,7 +22,8 @@ import json
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 # --- Config ---
 REPO_URL = os.environ.get("RESTIC_REPO_B2")
@@ -36,6 +39,13 @@ MAX_SNAPSHOT_WINDOW_HOURS = float(os.environ.get("MAX_SNAPSHOT_WINDOW_HOURS", "0
 
 # If set to 1, do not filter by timestamp and verify all *.sql.gz found in the snapshot
 VERIFY_ALL_SQL_GZ = os.environ.get("VERIFY_ALL_SQL_GZ") == "1"
+
+# Written by backup.py right after its own run; names the snapshot THIS host's
+# backup step just created, so verification checks that snapshot instead of
+# "newest in the shared B2 repo" (which may belong to a different host — INF-17).
+LAST_B2_SNAPSHOT_ID_FILE = Path(
+    os.environ.get("LAST_B2_SNAPSHOT_ID_FILE", "/srv/backups/.last_b2_snapshot_id")
+)
 
 
 def mask_repo(url: str) -> str:
@@ -89,24 +99,73 @@ def build_restic_env() -> dict:
     return env
 
 
-def get_latest_snapshot(env: dict) -> tuple[str, str]:
-    """
-    Uses `restic snapshots --latest 1 --json`, then sorts by time to pick the absolute newest.
-    """
-    cmd = [RESTIC_BIN, "snapshots", "--latest", "1", "--json"]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+def read_snapshot_id_file(path: Path) -> Optional[str]:
+    """Reads the snapshot id backup.py wrote for THIS host's run, if present."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        return value or None
+    except (FileNotFoundError, OSError):
+        return None
 
-    if res.returncode != 0:
-        raise RuntimeError(f"Failed to list snapshots: {res.stderr.strip()}")
 
-    snapshots = json.loads(res.stdout)
+def _parse_snapshot_instant(snap_time_str: str) -> datetime:
+    return datetime.fromisoformat(snap_time_str.replace("Z", "+00:00"))
+
+
+def choose_snapshot(snapshots: List[Dict], explicit_id: Optional[str] = None) -> Dict:
+    """
+    Pure selection logic (no subprocess): given a list of restic `snapshots --json`
+    dicts (each with "id" and "time"), pick the snapshot to verify.
+
+    - explicit_id set: the caller (backup.py, via LAST_B2_SNAPSHOT_ID_FILE) already
+      knows which snapshot is "ours" — use it even if a newer one is also present
+      (a foreign/newer snapshot must never win over an explicitly named one).
+    - explicit_id absent (manual/ad-hoc run): fall back to the newest by PARSED
+      INSTANT, never by ISO-string collation — a "+02:00" host's string sorts
+      above an earlier "+00:00" instant, which is the INF-17 defect.
+    """
+    if explicit_id:
+        matches = [
+            s for s in snapshots
+            if s["id"] == explicit_id or s["id"].startswith(explicit_id)
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Snapshot id '{explicit_id}' (from {LAST_B2_SNAPSHOT_ID_FILE}) matches "
+                f"{len(matches)} snapshots ambiguously — refusing to guess."
+            )
+        if matches:
+            return matches[0]
+        raise RuntimeError(
+            f"Snapshot '{explicit_id}' (from {LAST_B2_SNAPSHOT_ID_FILE}) not found "
+            f"among this host's snapshots."
+        )
+
     if not snapshots:
         raise RuntimeError("No snapshots found in repository")
 
-    snapshots.sort(key=lambda s: s["time"], reverse=True)
-    latest_id = snapshots[0]["id"]
-    snap_time_str = snapshots[0]["time"]
-    return latest_id, snap_time_str
+    return max(snapshots, key=lambda s: _parse_snapshot_instant(s["time"]))
+
+
+def list_host_snapshots(env: dict, host: str) -> List[Dict]:
+    """
+    Lists snapshots restricted to THIS host (backup.py tags every backup with
+    `--host <nodename>`). Constraining discovery to the host is what makes the
+    ad-hoc fallback path safe on a shared multi-target B2 repository.
+    """
+    cmd = [RESTIC_BIN, "snapshots", "--host", host, "--json"]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to list snapshots for host '{host}': {res.stderr.strip()}")
+
+    return json.loads(res.stdout)
+
+
+def get_target_snapshot(env: dict, host: str, explicit_id: Optional[str]) -> tuple[str, str]:
+    snapshots = list_host_snapshots(env, host)
+    chosen = choose_snapshot(snapshots, explicit_id)
+    return chosen["id"], chosen["time"]
 
 
 def list_sql_gz_files(env: dict, snapshot_id: str) -> List[str]:
@@ -169,8 +228,15 @@ def main() -> int:
     env = build_restic_env()
 
     try:
+        host = os.uname().nodename
+        explicit_id = read_snapshot_id_file(LAST_B2_SNAPSHOT_ID_FILE)
+        if explicit_id:
+            print(f"-> Verifying THIS host's snapshot (from {LAST_B2_SNAPSHOT_ID_FILE}): {explicit_id}")
+        else:
+            print(f"-> No {LAST_B2_SNAPSHOT_ID_FILE} found; falling back to newest snapshot for host '{host}'.")
+
         print("-> Checking snapshots...")
-        latest_id, snap_time_str = get_latest_snapshot(env)
+        latest_id, snap_time_str = get_target_snapshot(env, host, explicit_id)
         print(f"-> Latest snapshot ID: {latest_id}")
         print(f"-> Snapshot Date:      {snap_time_str}")
 

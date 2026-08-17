@@ -35,6 +35,11 @@ DUMP_DIR = Path("/srv/backups/db-dumps")
 PATHS_FILE = Path("/tmp/restic_backup_paths.txt")
 GENERATE_PATHS_SCRIPT = SCRIPTS_DIR / "generate_paths.py"
 
+# Hand-off for verify_backup.py (runs as a separate SSH session right after this
+# script): the B2 snapshot this run just created, so verification checks THIS
+# snapshot instead of re-discovering "newest in the repo" (INF-17).
+LAST_B2_SNAPSHOT_ID_FILE = Path("/srv/backups/.last_b2_snapshot_id")
+
 RESTIC_BIN = os.environ.get("RESTIC_BIN_OVERRIDE") or shutil.which("restic") or "/usr/bin/restic"
 DEBUG = os.environ.get("DEBUG") == "1"
 
@@ -183,6 +188,17 @@ def discover_docker_targets() -> List[Dict[str, str]]:
     return targets
 
 
+def utc_timestamp_str(now: Optional[datetime.datetime] = None) -> str:
+    """
+    Real UTC instant for the dump filename's `...Z` suffix (INF-17 defect 1: the
+    old code used naive local `datetime.now()` and appended a literal `Z`, so on
+    any non-UTC host the name lied about its own timezone).
+    """
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    return now.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
 def perform_db_dumps() -> None:
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=2)).timestamp()
     for f in DUMP_DIR.glob("*.sql.gz"):
@@ -197,7 +213,7 @@ def perform_db_dumps() -> None:
     except FileNotFoundError as exc:
         fail(f"Cannot prepare dump directory '{DUMP_DIR}'. Ensure /srv/backups exists. ({exc})")
 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H%M%SZ")
+    timestamp = utc_timestamp_str()
     targets = discover_docker_targets()
 
     log(f"Dump targets: {len(targets)}")
@@ -360,6 +376,17 @@ def main() -> None:
 
     if not ok_local or not ok_b2:
         fail("Restic backup failed for one or more repositories.")
+
+    if snap_b2:
+        try:
+            LAST_B2_SNAPSHOT_ID_FILE.write_text(snap_b2 + "\n", encoding="utf-8")
+        except OSError as exc:
+            # Non-fatal: verify_backup.py falls back to host-constrained discovery
+            # if this file is missing or stale.
+            log(f"WARN: could not write {LAST_B2_SNAPSHOT_ID_FILE} ({exc})")
+    else:
+        log(f"WARN: no B2 snapshot id captured from restic output; "
+            f"{LAST_B2_SNAPSHOT_ID_FILE} left unchanged.")
 
     log(f"SUMMARY: dumps ok, local={snap_local or 'n/a'}, b2={snap_b2 or 'n/a'}")
     log("== Backup Success ==")
