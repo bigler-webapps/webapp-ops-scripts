@@ -360,6 +360,34 @@ def run_restic(repo_url: Optional[str], repo_name: str, *, unlock_stale: bool = 
     return True, snap_id
 
 
+def record_b2_snapshot(snap_id: Optional[str]) -> None:
+    """
+    Persists the B2 snapshot id (for verify_backup.py's cross-session hand-off,
+    INF-17) and prints an unconditional, greppable marker line -- INF-24: this
+    must run and be visible in the Actions log EVEN IF a later step (retention)
+    fails the whole run, because `run_restic`'s own backup step already
+    succeeded and created a real snapshot by the time this is called. Calling
+    this before the ok_local/ok_b2 failure gate (not after) is the actual fix:
+    the previous ordering meant a retention failure's fail() -> sys.exit(1)
+    skipped this block entirely, so the marker stayed at whatever a PRIOR
+    successful run had left -- exactly the stale-marker trap the caller
+    (workflow-templates' backup action) must not fall into.
+    """
+    if snap_id:
+        try:
+            LAST_B2_SNAPSHOT_ID_FILE.write_text(snap_id + "\n", encoding="utf-8")
+        except OSError as exc:
+            # Non-fatal for the marker FILE: verify_backup.py falls back to
+            # host-constrained discovery if it's missing or stale. The stdout
+            # marker line below is the primary signal the calling workflow
+            # actually uses (INF-24) and does not depend on this write.
+            log(f"WARN: could not write {LAST_B2_SNAPSHOT_ID_FILE} ({exc})")
+        log(f"B2_SNAPSHOT_CREATED={snap_id}")
+    else:
+        log(f"WARN: no B2 snapshot id captured from restic output; "
+            f"{LAST_B2_SNAPSHOT_ID_FILE} left unchanged.")
+
+
 def main() -> None:
     global DOCKER_CMD
 
@@ -374,19 +402,10 @@ def main() -> None:
     ok_local, snap_local = run_restic(RESTIC_REPO_LOCAL, "Local", unlock_stale=True)
     ok_b2, snap_b2 = run_restic(RESTIC_REPO_B2, "B2")
 
+    record_b2_snapshot(snap_b2)
+
     if not ok_local or not ok_b2:
         fail("Restic backup failed for one or more repositories.")
-
-    if snap_b2:
-        try:
-            LAST_B2_SNAPSHOT_ID_FILE.write_text(snap_b2 + "\n", encoding="utf-8")
-        except OSError as exc:
-            # Non-fatal: verify_backup.py falls back to host-constrained discovery
-            # if this file is missing or stale.
-            log(f"WARN: could not write {LAST_B2_SNAPSHOT_ID_FILE} ({exc})")
-    else:
-        log(f"WARN: no B2 snapshot id captured from restic output; "
-            f"{LAST_B2_SNAPSHOT_ID_FILE} left unchanged.")
 
     log(f"SUMMARY: dumps ok, local={snap_local or 'n/a'}, b2={snap_b2 or 'n/a'}")
     log("== Backup Success ==")
