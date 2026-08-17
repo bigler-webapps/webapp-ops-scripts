@@ -166,6 +166,39 @@ def reset_database(db_container_id: str, db_user: str, db_name: str):
     run_cmd(["docker", "exec", db_container_id, "psql", "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", create_sql])
 
 
+def assert_schema_healthy(db_container_id: str, db_user: str, db_name: str):
+    """Fail when a restored public base table has no primary key."""
+    missing_primary_keys_sql = """
+        SELECT format('%I.%I', t.table_schema, t.table_name)
+        FROM information_schema.tables AS t
+        WHERE t.table_schema = 'public'
+          AND t.table_type = 'BASE TABLE'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM information_schema.table_constraints AS tc
+              WHERE tc.table_schema = t.table_schema
+                AND tc.table_name = t.table_name
+                AND tc.constraint_type = 'PRIMARY KEY'
+          )
+        ORDER BY t.table_schema, t.table_name;
+    """
+    result = run_cmd([
+        "docker", "exec", db_container_id,
+        "psql", "-U", db_user, "-d", db_name,
+        "-v", "ON_ERROR_STOP=1", "-Atc", missing_primary_keys_sql,
+    ])
+    missing_tables = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if missing_tables:
+        log(
+            "ERROR: Schema assertion failed: "
+            f"{len(missing_tables)} public base table(s) have no primary key: "
+            + ", ".join(missing_tables)
+        )
+        sys.exit(1)
+
+    log("-> Schema assertion passed: every public base table has a primary key.")
+
+
 def stream_restore_into_psql(env: dict, snapshot_id: str, dump_path: str, db_container_id: str, db_user: str, db_name: str):
     log("-> Importing dump (streamed from restic)...")
 
@@ -291,6 +324,7 @@ def mode_in_place(args):
         sys.exit(1)
 
     run_migrations(matched_project)
+    assert_schema_healthy(db_container_id, db_user, db_name)
 
     log(f"✅ App {args.app} successfully restored to staging.")
     return 0
@@ -419,6 +453,7 @@ def mode_import_only(args):
         sys.exit(1)
 
     run_migrations(matched_project)
+    assert_schema_healthy(db_container_id, db_user, db_name)
 
     log(f"✅ App {args.app} successfully restored from local dump into {args.target_env}.")
     return 0
