@@ -35,7 +35,14 @@ echo "== Disk usage (after) =="
 df -h /
 
 echo "== Docker images =="
-docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' | head -n 50
+# `head -n 50` closes the pipe once it has 50 lines; on a host with more than
+# 50 images `docker images` is still writing when that happens and dies on
+# SIGPIPE (exit 141), which `pipefail` + `set -e` then aborted the whole
+# script on (INF-19: staging crossed 50 images on 2026-08-12 and has failed
+# every night since). This line is diagnostic only, like every other docker
+# command above -- `|| true` neutralises exactly that closed-pipe case
+# without hiding a genuine docker failure any more than the prunes above do.
+docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' | head -n 50 || true
 
 echo "== Unattended-upgrades dry-run =="
 if command -v unattended-upgrades >/dev/null; then
