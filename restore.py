@@ -5,6 +5,8 @@ import json
 import argparse
 import subprocess
 import shutil
+import signal
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +40,26 @@ def run_cmd(cmd, env=None, check=True):
             print(res.stdout)
         sys.exit(1)
     return res
+
+
+def require_known_env(env_name: str, flag: str) -> None:
+    """Reject an environment name that is not one of the known ones (INF-33 S1).
+
+    The compose project is built as `f"{app}_{env}"`, and the separator is an
+    ordinary underscore, so the boundary is ambiguous while `env` is free text:
+    `--app foo --target-env bar_staging` and `--app foo_bar --target-env staging`
+    resolve to the same project. Constraining the env side removes the second
+    spelling.
+
+    This closes the AMBIGUITY, not the whole finding. A caller can still name a
+    different application directly (`--app other_app --target-env staging`).
+    Preventing that needs an allowlist of valid app names, which this script has
+    no source for -- it belongs at the boundary that already knows the registry.
+    """
+    if env_name not in ENV_ALIASES:
+        known = ", ".join(sorted(ENV_ALIASES))
+        log(f"ERROR: {flag} must be one of: {known} (got '{env_name}').")
+        sys.exit(1)
 
 
 def candidate_projects(app: str, env_name: str):
@@ -74,6 +96,82 @@ def find_db_container_id(project_candidates):
         if cid:
             return cid, project
     return "", ""
+
+
+@contextmanager
+def application_services_stopped(project: str, db_container_id: str):
+    """Stop the running non-database containers in one compose project.
+
+    Three properties this must hold, each of them a review finding:
+
+    * The restart survives every exit path (INF-33 R1). SIGTERM is the realistic
+      one for a CI-invoked script -- Python's default disposition terminates
+      without unwinding, so `finally` would never run and the application would
+      stay down. A handler that raises turns it into a normal unwind. SIGKILL
+      remains uncatchable; nothing can cover that.
+    * A failing restart must not eat the original error (INF-33 R2/S2).
+      `run_cmd` exits via `sys.exit`, i.e. `SystemExit`, which is NOT caught by
+      the callers' `except Exception` -- a raise from inside `finally` would
+      replace the real failure and suppress its message entirely. The restart is
+      therefore best-effort and loud.
+    * Finding nothing is not the same as there being nothing (INF-33 R3).
+      `find_compose_container` falls back to a name match when the compose label
+      is absent, so a label-only lookup that comes back empty may simply be
+      blind. Deliberately NOT solved by adding that fallback here: `docker ps -f
+      name=` is a substring match and would let one project's stop reach
+      another's containers. Disagreement is reported instead of papered over.
+    """
+    result = run_cmd([
+        "docker", "ps", "-q",
+        "-f", f"label=com.docker.compose.project={project}",
+    ])
+    labelled_ids = [cid.strip() for cid in result.stdout.splitlines() if cid.strip()]
+    application_container_ids = [cid for cid in labelled_ids if cid != db_container_id]
+
+    if not application_container_ids:
+        if db_container_id and db_container_id not in labelled_ids:
+            log(
+                f"ERROR: The database container was resolved for compose project "
+                f"'{project}', but a label lookup for that project returns no such "
+                f"container. Application containers cannot be identified reliably, so "
+                f"live writers may survive the import (INF-33). Refusing to continue."
+            )
+            sys.exit(1)
+        log(f"-> No running application services to stop for compose project '{project}'.")
+        yield
+        return
+
+    log(f"-> Stopping application services for compose project '{project}'...")
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _raise_on_sigterm(signum, frame):
+        raise SystemExit(f"Received signal {signum} while application services were stopped.")
+
+    try:
+        signal.signal(signal.SIGTERM, _raise_on_sigterm)
+    except ValueError:
+        # Not on the main thread; the handler is a best-effort guard, not a
+        # precondition for the restart itself.
+        previous_sigterm_handler = None
+
+    try:
+        run_cmd(["docker", "stop", *application_container_ids])
+        yield
+    finally:
+        log(f"-> Starting application services for compose project '{project}'...")
+        restart = run_cmd(["docker", "start", *application_container_ids], check=False)
+        if restart.returncode != 0:
+            # Loud, but non-raising: an exception here would replace whatever sent
+            # us into `finally` in the first place.
+            log(
+                f"ERROR: Failed to restart application services for compose project "
+                f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
+                f"attention: docker start {' '.join(application_container_ids)}"
+            )
+            if restart.stderr.strip():
+                log(restart.stderr.strip())
+        if previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def get_db_credentials(container_id: str):
@@ -315,14 +413,15 @@ def mode_in_place(args):
     dump_path = choose_dump_for_db(all_files, db_name, snap_time)
     log(f"Selected dump for db '{db_name}': {dump_path}")
 
-    reset_database(db_container_id, db_user, db_name)
-
     try:
-        stream_restore_into_psql(env, snapshot_id, dump_path, db_container_id, db_user, db_name)
+        with application_services_stopped(matched_project, db_container_id):
+            reset_database(db_container_id, db_user, db_name)
+            stream_restore_into_psql(env, snapshot_id, dump_path, db_container_id, db_user, db_name)
     except Exception as e:
         log(f"ERROR: Import failed: {e}")
         sys.exit(1)
 
+    # Migrations require the backend container, so the application is restarted first.
     run_migrations(matched_project)
     assert_schema_healthy(db_container_id, db_user, db_name)
 
@@ -340,6 +439,7 @@ def mode_dump_only(args):
     if not args.source_env:
         log("ERROR: --mode dump-only requires --source-env.")
         sys.exit(1)
+    require_known_env(args.source_env, "--source-env")
     if not args.output_dir:
         log("ERROR: --mode dump-only requires --output-dir.")
         sys.exit(1)
@@ -420,6 +520,7 @@ def mode_import_only(args):
     if not args.target_env:
         log("ERROR: --mode import-only requires --target-env.")
         sys.exit(1)
+    require_known_env(args.target_env, "--target-env")
     if not args.dump_file:
         log("ERROR: --mode import-only requires --dump-file.")
         sys.exit(1)
@@ -444,14 +545,15 @@ def mode_import_only(args):
         log("ERROR: Target DB container is missing backup.pg.user / backup.pg.db labels.")
         sys.exit(1)
 
-    reset_database(db_container_id, db_user, db_name)
-
     try:
-        stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name)
+        with application_services_stopped(matched_project, db_container_id):
+            reset_database(db_container_id, db_user, db_name)
+            stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name)
     except Exception as e:
         log(f"ERROR: Import failed: {e}")
         sys.exit(1)
 
+    # Migrations require the backend container, so the application is restarted first.
     run_migrations(matched_project)
     assert_schema_healthy(db_container_id, db_user, db_name)
 
