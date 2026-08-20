@@ -127,7 +127,11 @@ def _run_janitor_with_docker_stub(
         pytest.skip("no bash available on PATH")
 
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    # exist_ok: defensive only. Every current caller passes a fresh path (a
+    # bare `tmp_path`, or its own per-iteration subdirectory when looping
+    # over fixtures -- see test_runner_janitor_default_never_removed_either_ordering),
+    # so this never actually re-creates an existing directory today.
+    bin_dir.mkdir(exist_ok=True)
     log_path = tmp_path / "docker_calls.log"
     buildx_ls_path = tmp_path / "buildx_ls_output.txt"
     volume_ls_path = tmp_path / "volume_ls_output.txt"
@@ -174,7 +178,86 @@ exit 0
     return result, calls
 
 
-MULTILINE_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE = """\
+def _removed(calls, kind, name):
+    """Exact-line membership, not substring: `"buildx rm builder-X" in calls`
+    would ALSO match a call that actually removed the node-index-contaminated
+    "builder-X0" (X's own name is a string-prefix of X0) -- exactly the bug
+    class INF-46/INF-50 exist to catch. Each stub call is logged as
+    "<kind> <name>\\n" (see `_run_janitor_with_docker_stub`'s docker_stub),
+    so anchoring on the trailing newline makes this an exact-name check."""
+    return f"{kind} {name}\n" in calls
+
+
+# INF-50: reconstructed from the WO's own Part A two-builder walk-through
+# (already verified there against the real box), WITH the header row every
+# real `docker buildx ls` invocation prints added back in -- review finding:
+# an earlier draft of this fixture omitted it (harmless to the assertions,
+# since a header row never matches `^builder-` either way, but inaccurate to
+# label "literal real output" while missing a row real output always has).
+# Byte-exact WO Part B quote lives separately below, in
+# REAL_BUILDX_LS_ONE_BUILDER_DEFAULT_LAST_VERBATIM_FROM_WO. Preserves the
+# real shape that matters here: ` \_ ` node prefixes, the node-index digit,
+# `default*`'s trailing `*`, STATUS on the NODE line (not the header), and
+# `default` LAST -- INF-46's own fixture put `default` FIRST, which is why
+# 17/17 tests stayed green
+# while the live script silently dropped the real last builder every run --
+# a test against self-authored output confirms the author's own assumption,
+# not reality (this is the review question INF-50 was routed on).
+REAL_BUILDX_LS_TWO_INACTIVE_BUILDERS_DEFAULT_LAST = (
+    "NAME/NODE                                           DRIVER/ENDPOINT                   STATUS     BUILDKIT   PLATFORMS\n"
+    "builder-08591bd2-...        docker-container\n"
+    " \\_ builder-08591bd2-...0    \\_ unix:///var/run/docker.sock   inactive\n"
+    "builder-af6064dc-...        docker-container\n"
+    " \\_ builder-af6064dc-...0    \\_ unix:///var/run/docker.sock   inactive\n"
+    "default*                                            docker\n"
+    " \\_ default                  \\_ default                       running   v0.32.2   linux/amd64 (+3)\n"
+)
+
+# Character-for-character from work-orders/INF-50.md Part B ("wörtlich als
+# Fixture verwenden"), captured live on the box on the run that surfaced
+# this defect -- the single-builder case the WO cites by name, kept
+# separate from the two-builder fixtures above (which are transcribed from
+# the WO's own two-builder walk-through in Part A, not Part B) so that at
+# least one test traces to the WO's literal quoted bytes, not a
+# reconstruction of them.
+REAL_BUILDX_LS_ONE_BUILDER_DEFAULT_LAST_VERBATIM_FROM_WO = (
+    "NAME/NODE                                           DRIVER/ENDPOINT                   STATUS     BUILDKIT   PLATFORMS\n"
+    "builder-af6064dc-4c64-48f6-adba-9aa5364d00e3        docker-container                                        \n"
+    " \\_ builder-af6064dc-4c64-48f6-adba-9aa5364d00e30    \\_ unix:///var/run/docker.sock   inactive              \n"
+    "default*                                            docker                                                  \n"
+    " \\_ default                                          \\_ default                       running    v0.32.2    linux/amd64 (+3)\n"
+)
+
+
+def test_runner_janitor_removes_single_builder_wo_verbatim_fixture(tmp_path):
+    """INF-50: the exact fixture quoted in work-orders/INF-50.md Part B,
+    reproducing the live incident (one leftover builder, af6064dc, silently
+    never collected by any GC run since it was always the list's last
+    entry). Transcription error is the risk this test guards against that
+    the other fixtures above cannot: they're built from the WO's Part A
+    prose walk-through, not copied byte-for-byte from its Part B quote."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, buildx_ls_output=REAL_BUILDX_LS_ONE_BUILDER_DEFAULT_LAST_VERBATIM_FROM_WO
+    )
+    assert result.returncode == 0
+    assert _removed(calls, "buildx rm", "builder-af6064dc-4c64-48f6-adba-9aa5364d00e3"), calls
+    assert "default" not in calls
+
+
+REAL_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE_DEFAULT_LAST = (
+    "NAME/NODE                                           DRIVER/ENDPOINT                   STATUS     BUILDKIT   PLATFORMS\n"
+    "builder-08591bd2-...        docker-container\n"
+    " \\_ builder-08591bd2-...0    \\_ unix:///var/run/docker.sock   inactive\n"
+    "builder-af6064dc-...        docker-container\n"
+    " \\_ builder-af6064dc-...0    \\_ unix:///var/run/docker.sock   running\n"
+    "default*                                            docker\n"
+    " \\_ default                  \\_ default                       running   v0.32.2   linux/amd64 (+3)\n"
+)
+
+# Legacy ordering (`default` FIRST) -- not real `docker buildx ls` output,
+# but required test 4 (INF-50) demands the enumeration survive BOTH
+# orderings, not swap a fix for one against a regression in the other.
+LEGACY_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE_DEFAULT_FIRST = """\
 NAME/NODE                                     DRIVER/ENDPOINT       STATUS
 default                                       docker
   default                                     running
@@ -185,29 +268,72 @@ builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d  docker-container
 """
 
 
-def test_runner_janitor_removes_inactive_builder_keeps_active_one(tmp_path):
-    """Behavioural regression (INF-46): the structural guards above pin
-    text, not runtime behaviour, and would not catch the actual defect this
-    WO fixes -- an awk pattern that requires "inactive" on the SAME line
-    `docker buildx ls` prints the builder name on, which matches ZERO
-    builders against real multi-line `buildx ls` output (name on one line,
-    each node's status on an INDENTED line below it) and silently prunes
-    nothing. Stubs `docker` end-to-end with that realistic multi-line shape,
-    one active and one inactive builder, and asserts the script removes
-    exactly the inactive one via `buildx rm` and never touches the active
-    one."""
+def test_runner_janitor_removes_last_builder_before_default_real_output(tmp_path):
+    """INF-50 regression -- the actual defect: `docker buildx ls` always ends
+    with `default`, and `default` is always `running`. The pre-fix awk used
+    `/^builder-/` as BOTH the record boundary and the output test, so
+    `default`'s own line never flushed the prior (real, last) builder before
+    overwriting `name` -- its `running` node then got attributed to whatever
+    builder `name` still held, and `END{flush()}` suppressed it. Reproduced
+    live: one leftover builder survived every GC run because it was always
+    the list's last entry. Against the REAL two-builder output (default
+    last), BOTH builders must be enumerated -- not just the first."""
     result, calls = _run_janitor_with_docker_stub(
-        tmp_path, buildx_ls_output=MULTILINE_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE
+        tmp_path, buildx_ls_output=REAL_BUILDX_LS_TWO_INACTIVE_BUILDERS_DEFAULT_LAST
     )
     assert result.returncode == 0, (
         f"runner_janitor.sh exited {result.returncode}; "
         f"stdout tail:\n{result.stdout[-2000:]}\nstderr tail:\n{result.stderr[-2000:]}"
     )
-    assert "buildx rm builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d" in calls, calls
+    assert _removed(calls, "buildx rm", "builder-08591bd2-..."), calls
+    assert _removed(calls, "buildx rm", "builder-af6064dc-..."), calls
+
+
+def test_runner_janitor_default_never_removed_either_ordering(tmp_path):
+    """Required test 2 (INF-50): `default` must never appear in a removal
+    call, whether it sits first (legacy fixture) or last (real output)."""
+    for index, fixture in enumerate(
+        (
+            REAL_BUILDX_LS_TWO_INACTIVE_BUILDERS_DEFAULT_LAST,
+            LEGACY_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE_DEFAULT_FIRST,
+        )
+    ):
+        case_dir = tmp_path / f"case{index}"
+        case_dir.mkdir()
+        _, calls = _run_janitor_with_docker_stub(case_dir, buildx_ls_output=fixture)
+        assert "default" not in calls, (fixture, calls)
+
+
+def test_runner_janitor_skips_running_builder_that_is_last_before_default(tmp_path):
+    """Required test 3 (INF-50): an active builder must stay skipped even
+    when it is the LAST `builder-*` entry immediately before `default` --
+    exactly the position the original defect silently mishandled. Must not
+    "fix" INF-50 by dropping the running-check altogether."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, buildx_ls_output=REAL_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE_DEFAULT_LAST
+    )
+    assert result.returncode == 0
+    assert _removed(calls, "buildx rm", "builder-08591bd2-..."), calls
+    assert "builder-af6064dc" not in calls, (
+        f"the ACTIVE (running) builder, last before default, must never be removed: {calls}"
+    )
+
+
+def test_runner_janitor_removes_inactive_builder_keeps_active_one_legacy_ordering(tmp_path):
+    """Required test 4 (INF-50): the legacy `default`-first fixture stays a
+    covered case -- the enumeration must survive both orderings, not trade
+    one for the other."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, buildx_ls_output=LEGACY_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE_DEFAULT_FIRST
+    )
+    assert result.returncode == 0, (
+        f"runner_janitor.sh exited {result.returncode}; "
+        f"stdout tail:\n{result.stdout[-2000:]}\nstderr tail:\n{result.stderr[-2000:]}"
+    )
+    assert _removed(calls, "buildx rm", "builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d"), calls
     assert "builder-08591bd2" not in calls, (
         f"the ACTIVE builder must never be removed: {calls}"
     )
-    assert "default" not in calls
 
 
 def test_runner_janitor_fallback_removes_volume_with_no_buildx_entry(tmp_path):
@@ -222,7 +348,7 @@ def test_runner_janitor_fallback_removes_volume_with_no_buildx_entry(tmp_path):
         volume_ls_output="buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state\n",
     )
     assert result.returncode == 0
-    assert "volume rm buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state" in calls, calls
+    assert _removed(calls, "volume rm", "buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state"), calls
     assert "buildx rm" not in calls, "buildx ls listed no such builder -- nothing for buildx rm to remove"
 
 
@@ -246,7 +372,7 @@ def test_runner_janitor_fallback_volume_rm_failure_does_not_abort_script(tmp_pat
         f"stdout tail:\n{result.stdout[-2000:]}\nstderr tail:\n{result.stderr[-2000:]}"
     )
     assert "== Done ==" in result.stdout
-    assert "volume rm buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state" in calls, calls
+    assert _removed(calls, "volume rm", "buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state"), calls
 
 
 def test_runner_janitor_not_referenced_by_any_server_matrix_workflow():

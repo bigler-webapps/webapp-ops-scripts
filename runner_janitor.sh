@@ -40,20 +40,36 @@ echo "== Docker orphaned buildx builder cleanup (builder + container + state vol
 # node index (.../builder-<uuid>0_state) that a prefix/suffix-stripping
 # derivation would silently get wrong, leaving the script deleting nothing.
 #
-# The awk state machine below matches only the UNINDENTED builder-level row
-# for the NAME (`docker buildx ls` prints each builder's node(s) on an
-# INDENTED line below it, so `^builder-`, anchored with no leading
-# whitespace, never matches those -- the node index never enters the
-# captured name), while checking EVERY line belonging to that builder
-# (header line and any indented node lines below it) for the word
-# "running" before deciding to print it. This is deliberately NOT a
-# same-line "inactive" check: `docker buildx ls` puts a builder's status on
-# its OWN indented node line in the common multi-line form, not on the
-# header line the name comes from, and requiring both on one line would
-# silently match nothing at all -- a builder is only skipped when a
-# "running" node is actually seen, never assumed idle by the shape of the
-# output. The match is WHOLE-WORD (word boundaries via [[:space:]]/anchors),
-# not a bare substring: a plain `/running/` would also fire on unrelated
+# The awk state machine below separates two DIFFERENT things (INF-50: an
+# earlier version conflated them, and that conflation is exactly what made
+# `docker buildx ls` always drop its own last builder -- see below):
+#   - RECORD BOUNDARY: any UNINDENTED line starts a new record (builder or
+#     otherwise). `docker buildx ls` prints each builder's node(s) on an
+#     INDENTED line below it, so this never mistakes a node line for a new
+#     record and the node index never enters a captured name.
+#   - OUTPUT CRITERION: a record is only printed if its name matches
+#     `^builder-` AND no line in that whole record (header or any indented
+#     node line) said "running".
+# INF-50: the previous version used `/^builder-/` as BOTH the record
+# boundary and part of the output test. `docker buildx ls` always ends with
+# the `default` builder, and `default` is always `running` -- `default`'s
+# own header line never matches `/^builder-/`, so it never flushed the
+# PRIOR (real) builder's record before overwriting `name`, and its node
+# line's "running" then got attributed to whatever builder `name` still
+# held. Net effect: the actual LAST builder in the list was silently
+# dropped on every single run, deterministically -- reproduced against a
+# real box (buildx v0.32.2, Docker 29.7.2) that had exactly one leftover
+# builder, `docker buildx ls` ending in `default*`, and it was never
+# collected. Splitting "what starts a new record" from "what may be
+# printed" is what fixes this: `default`'s line still starts a new record
+# (so the prior builder gets flushed), it just never OUTPUTS because its
+# name doesn't match `^builder-`.
+#
+# INF-46's own history repeats the same class of error INF-46 itself was
+# written to fix: a same-line "inactive" check would again match nothing
+# (see INF-46), so status is deliberately checked across the WHOLE record,
+# and the check is WHOLE-WORD (word boundaries via [[:space:]]/anchors), not
+# a bare substring -- a plain `/running/` would also fire on unrelated
 # column content that merely contains the substring (e.g. a socket path
 # like ".../overrunning.sock"), wrongly marking that builder as active.
 while IFS= read -r name; do
@@ -62,8 +78,8 @@ while IFS= read -r name; do
   docker buildx rm "$name" || true
 done < <(docker buildx ls 2>/dev/null | awk '
   function is_running() { return $0 ~ /(^|[[:space:]])running([[:space:]]|$)/ }
-  function flush() { if (name != "" && !running) print name }
-  /^builder-/ { flush(); name = $1; running = is_running() ? 1 : 0; next }
+  function flush() { if (name ~ /^builder-/ && !running) print name }
+  /^[^[:space:]]/ { flush(); name = $1; running = is_running() ? 1 : 0; next }
   is_running() { running = 1 }
   END { flush() }
 ' || true)
