@@ -3,12 +3,19 @@
 Run: pytest test_runner_janitor.py
 """
 
+import os
 import re
+import shutil
+import stat
+import subprocess
 
 from pathlib import Path
 
+import pytest
+
 RUNNER_JANITOR = Path(__file__).with_name("runner_janitor.sh")
 JANITOR = Path(__file__).with_name("janitor.sh")
+BASH = shutil.which("bash")
 
 # Sibling repos on disk in this workspace layout (…/webapps/<repo>). Not
 # guaranteed to exist in every checkout (e.g. a standalone CI clone of just
@@ -55,6 +62,191 @@ def test_janitor_still_never_prunes_volumes():
     invariant, which protects real app-server data."""
     script = JANITOR.read_text(encoding="utf-8")
     assert "volume prune" not in script
+
+
+def test_runner_janitor_buildx_cleanup_uses_buildx_rm():
+    """INF-46 regression: `docker rm` on the orphaned builder CONTAINER alone
+    (the pre-INF-46 approach) leaves the builder registered and its state
+    volume behind. `docker buildx rm` removes builder + container + volume
+    together -- this is now the only removal path for these entries."""
+    script = RUNNER_JANITOR.read_text(encoding="utf-8")
+    assert "docker buildx rm" in script
+    assert 'docker ps -a --filter "name=buildx_buildkit_builder-"' not in script
+
+
+def test_runner_janitor_buildx_builder_name_comes_from_buildx_ls():
+    """INF-46: the builder name must be read from `docker buildx ls` itself,
+    never derived from a container/volume name -- those carry a different
+    prefix (buildx_buildkit_builder- vs builder-) plus a trailing node index
+    (.../builder-<uuid>0_state) that a substring-derived name would silently
+    get wrong, per the WO's own documented trap. This also pins that the
+    node-index pitfall is actually documented in the script, not just avoided
+    by accident."""
+    script = RUNNER_JANITOR.read_text(encoding="utf-8")
+    assert "docker buildx ls" in script
+    assert "node index" in script
+
+
+def test_runner_janitor_no_blanket_volume_prune_all():
+    """Non-goal, INF-46: `docker volume prune -af`/`--all` would hit every
+    unused named volume on the host, widening exactly the blast radius the
+    INF-42 review already had to narrow (this script's own rsync exposure
+    to app-server disks). Cleanup here must stay targeted at the specific
+    buildx naming pattern instead.
+
+    Checks actual flag TOKENS, not a bare "-a" substring: a naive substring
+    check would miss a combined short-flag ordering like `-fa` (still
+    "force + all", the same forbidden semantics as `-af`) because the
+    literal characters "-a" never appear in "-fa"."""
+    script = RUNNER_JANITOR.read_text(encoding="utf-8")
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "volume prune" not in stripped:
+            continue
+        command = stripped.split("#", 1)[0]
+        flags = command.split("volume prune", 1)[1]
+        for token in flags.split():
+            if token.startswith("--"):
+                assert token != "--all", line
+            elif token.startswith("-"):
+                assert "a" not in token[1:], line
+
+
+def _run_janitor_with_docker_stub(
+    tmp_path,
+    buildx_ls_output="",
+    volume_ls_output="",
+    volume_rm_exit=0,
+):
+    """Runs the real runner_janitor.sh against a stubbed `docker` on PATH.
+    Returns (result, calls) where `calls` is the stub's own invocation log
+    (one line per buildx rm / volume rm call), letting each test assert on
+    exactly what the script tried to remove without needing a real Docker
+    daemon or a real buildx state."""
+    if not BASH:
+        pytest.skip("no bash available on PATH")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log_path = tmp_path / "docker_calls.log"
+    buildx_ls_path = tmp_path / "buildx_ls_output.txt"
+    volume_ls_path = tmp_path / "volume_ls_output.txt"
+    buildx_ls_path.write_text(buildx_ls_output, encoding="utf-8", newline="\n")
+    volume_ls_path.write_text(volume_ls_output, encoding="utf-8", newline="\n")
+
+    docker_stub = f"""#!/usr/bin/env bash
+LOG="{log_path!s}"
+case "$1 $2" in
+  "buildx ls")
+    cat "{buildx_ls_path!s}"
+    ;;
+  "buildx rm")
+    echo "buildx rm $3" >> "$LOG"
+    ;;
+  "volume ls")
+    cat "{volume_ls_path!s}"
+    ;;
+  "volume rm")
+    echo "volume rm $3" >> "$LOG"
+    exit {volume_rm_exit}
+    ;;
+  *)
+    true
+    ;;
+esac
+exit 0
+"""
+    stub_path = bin_dir / "docker"
+    stub_path.write_text(docker_stub, encoding="utf-8", newline="\n")
+    stub_path.chmod(stub_path.stat().st_mode | stat.S_IEXEC)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+
+    result = subprocess.run(
+        [BASH, str(RUNNER_JANITOR)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    calls = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    return result, calls
+
+
+MULTILINE_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE = """\
+NAME/NODE                                     DRIVER/ENDPOINT       STATUS
+default                                       docker
+  default                                     running
+builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d  docker-container
+  builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0  running
+builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d  docker-container
+  builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d0  inactive
+"""
+
+
+def test_runner_janitor_removes_inactive_builder_keeps_active_one(tmp_path):
+    """Behavioural regression (INF-46): the structural guards above pin
+    text, not runtime behaviour, and would not catch the actual defect this
+    WO fixes -- an awk pattern that requires "inactive" on the SAME line
+    `docker buildx ls` prints the builder name on, which matches ZERO
+    builders against real multi-line `buildx ls` output (name on one line,
+    each node's status on an INDENTED line below it) and silently prunes
+    nothing. Stubs `docker` end-to-end with that realistic multi-line shape,
+    one active and one inactive builder, and asserts the script removes
+    exactly the inactive one via `buildx rm` and never touches the active
+    one."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, buildx_ls_output=MULTILINE_BUILDX_LS_ONE_ACTIVE_ONE_INACTIVE
+    )
+    assert result.returncode == 0, (
+        f"runner_janitor.sh exited {result.returncode}; "
+        f"stdout tail:\n{result.stdout[-2000:]}\nstderr tail:\n{result.stderr[-2000:]}"
+    )
+    assert "buildx rm builder-4fa805b0-0f65-4a9b-aa3f-89f436e5ae0d" in calls, calls
+    assert "builder-08591bd2" not in calls, (
+        f"the ACTIVE builder must never be removed: {calls}"
+    )
+    assert "default" not in calls
+
+
+def test_runner_janitor_fallback_removes_volume_with_no_buildx_entry(tmp_path):
+    """R1 review finding (INF-46): the fallback volume-cleanup path (for a
+    state volume whose builder entry is already gone from buildx's own
+    registry -- WO Part B, second seam) had zero test coverage. `buildx ls`
+    knows nothing here; the orphaned volume must be picked up and removed
+    directly, by name pattern, via the fallback loop."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path,
+        buildx_ls_output="NAME/NODE   DRIVER/ENDPOINT\ndefault     docker\n",
+        volume_ls_output="buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state\n",
+    )
+    assert result.returncode == 0
+    assert "volume rm buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state" in calls, calls
+    assert "buildx rm" not in calls, "buildx ls listed no such builder -- nothing for buildx rm to remove"
+
+
+def test_runner_janitor_fallback_volume_rm_failure_does_not_abort_script(tmp_path):
+    """R1 review finding (INF-46): the WO's own Risks section says an active
+    builder's volume must never be removed -- the actual backstop for that
+    is Docker itself refusing to remove a volume still mounted by a
+    container, not a check in this script. What IS this script's own
+    responsibility is surviving that refusal: `docker volume rm` failing
+    (simulated here as exit 1, the real "volume is in use" case) must not
+    abort the run via `set -euo pipefail` -- the `|| true` after it must
+    hold, and the script must still reach its own end."""
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path,
+        buildx_ls_output="NAME/NODE   DRIVER/ENDPOINT\ndefault     docker\n",
+        volume_ls_output="buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state\n",
+        volume_rm_exit=1,
+    )
+    assert result.returncode == 0, (
+        f"a failed docker volume rm must not abort the script; "
+        f"stdout tail:\n{result.stdout[-2000:]}\nstderr tail:\n{result.stderr[-2000:]}"
+    )
+    assert "== Done ==" in result.stdout
+    assert "volume rm buildx_buildkit_builder-08591bd2-6d51-431e-a0a6-63f2f5fca89d0_state" in calls, calls
 
 
 def test_runner_janitor_not_referenced_by_any_server_matrix_workflow():
