@@ -36,14 +36,23 @@ def test_janitor_reports_docker_and_containerd_storage_for_diagnosis():
     assert "/var/lib/docker/*/ /var/lib/containerd/*/" in script
 
 
+def test_unattended_upgrades_dry_run_is_removed():
+    script = JANITOR.read_text(encoding="utf-8")
+    assert "== Unattended-upgrades dry-run ==" not in script
+
+    non_comment_lines = [
+        line for line in script.splitlines()
+        if not line.strip().startswith("#")
+    ]
+    assert not any("unattended-upgrades" in line for line in non_comment_lines)
+
+
 def test_no_unguarded_producer_into_head_pipeline():
     """INF-19: `docker images | head -n 50` used to abort the whole script on
     SIGPIPE once a host had more than 50 images (staging, exit 141, red every
     night since 2026-08-12) -- `head` closes the pipe early and `set -o
     pipefail` + `set -e` propagate the producer's SIGPIPE death as a script
-    abort. Every producer-into-`head` pipeline in this script must be
-    guarded the same way the pre-existing `unattended-upgrades | head -n 80`
-    line already was."""
+    abort. Every producer-into-`head` pipeline in this script must be guarded."""
     script = JANITOR.read_text(encoding="utf-8")
     offending = [
         line for line in script.splitlines()
@@ -92,10 +101,6 @@ def test_janitor_survives_docker_images_output_over_50_lines(tmp_path):
         "    ;;\n"
         "esac\n",
     )
-    # Shadow any real unattended-upgrades on PATH so the test stays hermetic
-    # (it would otherwise try to touch the real system's apt state).
-    _stub("unattended-upgrades", "#!/usr/bin/env bash\necho stub dry-run\n")
-
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
 
@@ -127,7 +132,7 @@ def _stub_bin(bin_dir, name: str, body: str) -> None:
 
 
 def _make_stub_env(tmp_path, docker_body: str, disk_pct: int = 40):
-    """Build a PATH with `docker`, `df` and `unattended-upgrades` stubbed.
+    """Build a PATH with `docker` and `df` stubbed.
 
     `df` must be stubbed too: the script now READS the disk figure and fails
     above the threshold, so leaving the real df in place would make every one
@@ -146,8 +151,6 @@ def _make_stub_env(tmp_path, docker_body: str, disk_pct: int = 40):
         "echo 'Filesystem     1024-blocks     Used Available Capacity Mounted on'\n"
         "echo '/dev/sda1        164802308 96000000  60000000 " + str(disk_pct) + "% /'\n",
     )
-    _stub_bin(bin_dir, "unattended-upgrades", "#!/usr/bin/env bash\necho stub dry-run\n")
-
     env = os.environ.copy()
     env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
     env["RM_LOG"] = str(tmp_path / "removed.txt")

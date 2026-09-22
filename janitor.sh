@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Purpose: Light-weight maintenance: docker prune, disk usage, unattended-upgrades dry-run.
+# Purpose: Light-weight maintenance: docker prune and disk usage.
 #
 # INF-1 (2026-08-01): `docker system prune -f` alone only removes DANGLING
 # resources (untagged images, stopped containers) -- it never touches tagged-
@@ -217,13 +217,6 @@ echo "== Docker images =="
 # every night since). This line is diagnostic only -- `|| true` neutralises
 # exactly that closed-pipe case. The prunes above no longer carry it (INF-51).
 docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' | head -n 50 || true
-
-echo "== Unattended-upgrades dry-run =="
-if command -v unattended-upgrades >/dev/null; then
-  unattended-upgrades --dry-run --debug | head -n 80 || true
-else
-  echo "unattended-upgrades not installed"
-fi
 
 # Last, so every diagnostic above is already on the log when this fires.
 # `df -P` for the POSIX one-line-per-filesystem guarantee; `-h` above is for
