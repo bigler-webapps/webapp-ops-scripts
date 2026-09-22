@@ -45,8 +45,8 @@ def _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, completion_ti
         return True, "", ""
 
     monkeypatch.setattr(backup, "run_cmd", fake_run_cmd)
-    backup.perform_db_dumps()
-    return sorted(tmp_path.glob("*.sql.gz")), gzip_checks
+    dump_names = backup.perform_db_dumps()
+    return sorted(tmp_path.glob("*.sql.gz")), gzip_checks, dump_names
 
 
 def _run_verification(monkeypatch, files, snapshot_time):
@@ -54,6 +54,7 @@ def _run_verification(monkeypatch, files, snapshot_time):
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "password")
     monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb, "read_run_dumps_file", lambda path: [path.name for path in files])
     monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
     monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
     monkeypatch.setattr(
@@ -93,9 +94,10 @@ def test_dump_completed_after_long_run_is_fresh_and_selected(monkeypatch, tmp_pa
     snapshot_time = completion + timedelta(seconds=38)
     targets = [{"id": "research1", "name": "research-prod", "user": "postgres", "db": "hram"}]
 
-    files, gzip_checks = _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, [completion])
+    files, gzip_checks, dump_names = _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, [completion])
 
     assert len(files) == 1
+    assert dump_names == [files[0].name]
     assert vb.parse_timestamp_from_filename(str(files[0])) == completion
     assert gzip_checks == [["gzip", "-t", str(tmp_path / "research-prod_hram_research1.sql.gz.tmp")]]
     assert _run_verification(monkeypatch, files, snapshot_time) == [str(files[0])]
@@ -110,9 +112,10 @@ def test_dumps_from_one_run_keep_their_individual_completion_times(monkeypatch, 
         {"id": "target2", "name": "second", "user": "postgres", "db": "app"},
     ]
 
-    files, _ = _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, completions)
+    files, _, dump_names = _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, completions)
 
     assert [vb.parse_timestamp_from_filename(str(path)) for path in files] == completions
+    assert dump_names == [path.name for path in files]
     assert _run_verification(monkeypatch, files, snapshot_time) == [str(path) for path in files]
 
 
@@ -120,7 +123,7 @@ def test_backup_filename_round_trips_through_verify_parser(monkeypatch, tmp_path
     completion = datetime(2026, 9, 21, 8, 18, 30, tzinfo=timezone.utc)
     targets = [{"id": "target1", "name": "main-prod", "user": "postgres", "db": "appdb"}]
 
-    files, _ = _perform_mock_dumps(monkeypatch, tmp_path, targets, completion, [completion])
+    files, _, _ = _perform_mock_dumps(monkeypatch, tmp_path, targets, completion, [completion])
 
     assert len(files) == 1
     assert vb.parse_timestamp_from_filename(str(files[0])) == completion
@@ -186,6 +189,15 @@ def test_record_b2_snapshot_no_marker_line_when_no_snapshot_was_created(capsys):
     assert "WARN: no B2 snapshot id captured" in out
 
 
+def test_record_run_dumps_writes_one_filename_per_line(tmp_path, monkeypatch):
+    marker = tmp_path / ".last_run_dumps"
+    monkeypatch.setattr(backup, "LAST_RUN_DUMPS_FILE", marker)
+
+    backup.record_run_dumps(["first.sql.gz", "second.sql.gz"])
+
+    assert marker.read_text(encoding="utf-8") == "first.sql.gz\nsecond.sql.gz\n"
+
+
 def test_main_records_marker_before_the_retention_failure_exit(monkeypatch, tmp_path):
     # End-to-end ordering guard: main() must call record_b2_snapshot() before
     # the ok_local/ok_b2 fail() gate. Against the pre-INF-24 ordering, fail()'s
@@ -197,7 +209,9 @@ def test_main_records_marker_before_the_retention_failure_exit(monkeypatch, tmp_
     monkeypatch.setattr(backup, "determine_docker_command", lambda: ["docker"])
     monkeypatch.setattr(backup, "ensure_restic_available", lambda: None)
     monkeypatch.setattr(backup, "generate_paths_file", lambda: None)
-    monkeypatch.setattr(backup, "perform_db_dumps", lambda: None)
+    dump_marker = tmp_path / ".last_run_dumps"
+    monkeypatch.setattr(backup, "LAST_RUN_DUMPS_FILE", dump_marker)
+    monkeypatch.setattr(backup, "perform_db_dumps", lambda: ["run.sql.gz"])
 
     def fake_run_restic(repo_url, repo_name, *, unlock_stale=False):
         if repo_name == "Local":
@@ -210,3 +224,35 @@ def test_main_records_marker_before_the_retention_failure_exit(monkeypatch, tmp_
         backup.main()
 
     assert marker.read_text(encoding="utf-8") == "b2snap001\n"
+    assert dump_marker.read_text(encoding="utf-8") == "run.sql.gz\n"
+
+
+def test_dump_manifest_is_not_updated_when_b2_snapshot_creation_fails_entirely(monkeypatch, tmp_path):
+    # R1 (review finding, WM-OPS-9): the dump manifest must go stale IN LOCKSTEP with the
+    # snapshot-id marker, never ahead of it -- otherwise a B2 failure could leave
+    # LAST_B2_SNAPSHOT_ID_FILE pointing at an OLDER snapshot while LAST_RUN_DUMPS_FILE already
+    # names THIS run's (different) dumps, a desync verify_backup.py cannot detect on its own.
+    snap_marker = tmp_path / ".last_b2_snapshot_id"
+    snap_marker.write_text("previous_snapshot_id\n", encoding="utf-8")
+    dump_marker = tmp_path / ".last_run_dumps"
+    dump_marker.write_text("previous_run.sql.gz\n", encoding="utf-8")
+    monkeypatch.setattr(backup, "LAST_B2_SNAPSHOT_ID_FILE", snap_marker)
+    monkeypatch.setattr(backup, "LAST_RUN_DUMPS_FILE", dump_marker)
+    monkeypatch.setattr(backup, "determine_docker_command", lambda: ["docker"])
+    monkeypatch.setattr(backup, "ensure_restic_available", lambda: None)
+    monkeypatch.setattr(backup, "generate_paths_file", lambda: None)
+    monkeypatch.setattr(backup, "perform_db_dumps", lambda: ["this_run.sql.gz"])
+
+    def fake_run_restic(repo_url, repo_name, *, unlock_stale=False):
+        if repo_name == "Local":
+            return True, "local0001"
+        return False, None  # B2 backup failed outright -- no snapshot was created at all
+
+    monkeypatch.setattr(backup, "run_restic", fake_run_restic)
+
+    with pytest.raises(SystemExit):
+        backup.main()
+
+    # Both markers stay at their PREVIOUS values -- neither updates without the other.
+    assert snap_marker.read_text(encoding="utf-8") == "previous_snapshot_id\n"
+    assert dump_marker.read_text(encoding="utf-8") == "previous_run.sql.gz\n"

@@ -8,8 +8,8 @@ dumps and that every dump can be streamed from the repo and passes a gzip integr
 - Verifies the exact snapshot backup.py's own run just created (via
   LAST_B2_SNAPSHOT_ID_FILE); falls back to the newest snapshot tagged with this
   host (--host <nodename>), by parsed instant, for ad-hoc/manual runs.
-- Filters *.sql.gz by a time window around the snapshot time (default: 2 hours).
-- Verifies ALL matching dumps (not just one) by piping `restic dump` -> `gzip -t`.
+- Reads the exact dump filenames written by backup.py for this run.
+- Verifies every one present in the selected snapshot by piping `restic dump` -> `gzip -t`.
 
 Exit code:
 - 0 on success
@@ -45,6 +45,9 @@ VERIFY_ALL_SQL_GZ = os.environ.get("VERIFY_ALL_SQL_GZ") == "1"
 # "newest in the shared B2 repo" (which may belong to a different host — INF-17).
 LAST_B2_SNAPSHOT_ID_FILE = Path(
     os.environ.get("LAST_B2_SNAPSHOT_ID_FILE", "/srv/backups/.last_b2_snapshot_id")
+)
+LAST_RUN_DUMPS_FILE = Path(
+    os.environ.get("LAST_RUN_DUMPS_FILE", "/srv/backups/.last_run_dumps")
 )
 
 
@@ -106,6 +109,23 @@ def read_snapshot_id_file(path: Path) -> Optional[str]:
         return value or None
     except (FileNotFoundError, OSError):
         return None
+
+
+def read_run_dumps_file(path: Path) -> List[str]:
+    """Read the completed dump filenames written by backup.py for this run."""
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Run dump manifest is missing: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Run dump manifest is unreadable: {path} ({exc})") from exc
+
+    filenames = [line.strip() for line in contents.splitlines() if line.strip()]
+    if not filenames:
+        raise RuntimeError(f"Run dump manifest is empty: {path}")
+    if len(filenames) != len(set(filenames)):
+        raise RuntimeError(f"Run dump manifest contains duplicate filenames: {path}")
+    return filenames
 
 
 def _parse_snapshot_instant(snap_time_str: str) -> datetime:
@@ -240,29 +260,37 @@ def main() -> int:
         print(f"-> Latest snapshot ID: {latest_id}")
         print(f"-> Snapshot Date:      {snap_time_str}")
 
-        snap_time = datetime.fromisoformat(snap_time_str.replace("Z", "+00:00"))
-        min_time = snap_time - timedelta(hours=MAX_SNAPSHOT_WINDOW_HOURS)
-        max_time = snap_time + timedelta(minutes=5)
-
         print("-> Searching for .sql.gz files in snapshot...")
         all_files = list_sql_gz_files(env, latest_id)
 
-        if not all_files:
-            print("[ERROR] No .sql.gz files found in snapshot at all!")
-            return 1
-
         if VERIFY_ALL_SQL_GZ:
+            if not all_files:
+                print("[ERROR] No .sql.gz files found in snapshot at all!")
+                return 1
             candidates = all_files
             print(f"-> VERIFY_ALL_SQL_GZ=1: verifying ALL {len(candidates)} .sql.gz files (no time filter).")
         else:
-            candidates = []
-            for f in all_files:
-                ts = parse_timestamp_from_filename(f)
-                if ts and (min_time <= ts <= max_time):
-                    candidates.append(f)
+            try:
+                manifest_filenames = read_run_dumps_file(LAST_RUN_DUMPS_FILE)
+            except RuntimeError as exc:
+                print("----------------------------------------------------------------")
+                print(f"[CRITICAL FAILURE] {exc}")
+                print("Refusing to fall back to snapshot-time selection.")
+                print("----------------------------------------------------------------")
+                return 1
 
-            print(f"-> Filtering for files within {MAX_SNAPSHOT_WINDOW_HOURS}h of snapshot time")
-            print(f"   Window: {min_time.strftime('%Y-%m-%d %H:%M:%S')} UTC  ..  {max_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            files_by_name = {os.path.basename(path): path for path in all_files}
+            missing = [name for name in manifest_filenames if name not in files_by_name]
+            if missing:
+                print("----------------------------------------------------------------")
+                print("[CRITICAL FAILURE] Run dump manifest entries missing from snapshot:")
+                for name in missing:
+                    print(f"- {name}")
+                print("The snapshot is incomplete; refusing to verify a partial run.")
+                print("----------------------------------------------------------------")
+                return 1
+
+            candidates = [files_by_name[name] for name in manifest_filenames]
             print(f"-> Found {len(candidates)} matching dumps out of {len(all_files)} .sql.gz files.")
 
         if not candidates:

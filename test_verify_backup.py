@@ -93,6 +93,7 @@ def test_snapshot_with_only_legacy_formats_selects_both(monkeypatch):
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "password")
     monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb, "read_run_dumps_file", lambda path: files)
     monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
     monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
     monkeypatch.setattr(
@@ -111,7 +112,7 @@ def test_snapshot_with_only_legacy_formats_selects_both(monkeypatch):
     assert verified == files
 
 
-def test_genuinely_stale_dump_is_rejected(monkeypatch):
+def test_manifest_named_dump_outside_old_window_is_verified(monkeypatch):
     snapshot_time = datetime(2026, 9, 21, 8, 18, 42, tzinfo=timezone.utc)
     stale_file = "research-prod_hram_2026-09-21T070000Z.sql.gz"
     verified = []
@@ -119,6 +120,7 @@ def test_genuinely_stale_dump_is_rejected(monkeypatch):
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "password")
     monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb, "read_run_dumps_file", lambda path: [stale_file])
     monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
     monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
     monkeypatch.setattr(
@@ -133,8 +135,8 @@ def test_genuinely_stale_dump_is_rejected(monkeypatch):
         lambda env, snapshot_id, path: verified.append(path),
     )
 
-    assert vb.main() == 1
-    assert verified == []
+    assert vb.main() == 0
+    assert verified == [stale_file]
 
 
 def test_mixed_snapshot_verifies_only_the_fresh_dump_not_the_stale_one(monkeypatch):
@@ -152,6 +154,7 @@ def test_mixed_snapshot_verifies_only_the_fresh_dump_not_the_stale_one(monkeypat
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "password")
     monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb, "read_run_dumps_file", lambda path: [fresh_file])
     monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
     monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
     monkeypatch.setattr(
@@ -187,6 +190,7 @@ def test_no_matching_dumps_still_exits_non_zero(monkeypatch):
     monkeypatch.setenv("RESTIC_PASSWORD", "x")
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "x")
+    monkeypatch.setattr(vb, "read_run_dumps_file", lambda path: ["missing.sql.gz"])
     monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
     monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
     monkeypatch.setattr(
@@ -196,3 +200,231 @@ def test_no_matching_dumps_still_exits_non_zero(monkeypatch):
     monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [])
 
     assert vb.main() == 1
+
+
+def test_current_run_verifies_every_manifest_dump_even_outside_old_window(monkeypatch, tmp_path):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    old_dump = "hpc-bridge_db_2026-09-22T100000Z.sql.gz"
+    recent_dump = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{old_dump}\n{recent_dump}\n", encoding="utf-8")
+    verified = []
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [old_dump, recent_dump])
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 0
+    assert verified == [old_dump, recent_dump]
+
+
+def test_manifest_dump_thirty_minutes_before_snapshot_is_verified(monkeypatch, tmp_path):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    dump = "hpc-bridge_db_2026-09-22T100000Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{dump}\n", encoding="utf-8")
+    verified = []
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [dump])
+    monkeypatch.setattr(vb, "verify_gzip_stream_from_restic", lambda env, snapshot_id, path: verified.append(path))
+
+    assert vb.main() == 0
+    assert verified == [dump]
+
+
+def test_manifest_dump_missing_from_snapshot_fails_and_names_it(monkeypatch, tmp_path, capsys):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    present = "hram_db_2026-09-22T102500Z.sql.gz"
+    missing = "hpc-bridge_db_2026-09-22T100000Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{present}\n{missing}\n", encoding="utf-8")
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [present])
+
+    assert vb.main() == 1
+    assert missing in capsys.readouterr().out
+
+
+def test_previous_run_dump_in_snapshot_is_excluded(monkeypatch, tmp_path):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    previous = "hram_db_2026-09-21T102500Z.sql.gz"
+    current = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{current}\n", encoding="utf-8")
+    verified = []
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [previous, current])
+    monkeypatch.setattr(vb, "verify_gzip_stream_from_restic", lambda env, snapshot_id, path: verified.append(path))
+
+    assert vb.main() == 0
+    assert verified == [current]
+
+
+def test_missing_manifest_fails_without_time_window_fallback(monkeypatch, tmp_path, capsys):
+    # R1 (review finding, WM-OPS-9): assert the fallback path is not merely UNMENTIONED in the
+    # output but genuinely never REACHED -- a regression that logs this exact message and then
+    # falls back to verifying anyway would satisfy a string-only assertion but not this spy.
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    dump = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    verified = []
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [dump])
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 1
+    output = capsys.readouterr().out
+    assert "Run dump manifest is missing" in output
+    assert "fall back" in output
+    assert verified == []
+
+
+def test_unreadable_manifest_fails_closed(monkeypatch, tmp_path, capsys):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    dump = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{dump}\n", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == manifest:
+            raise OSError("permission denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [dump])
+    verified = []
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 1
+    assert "Run dump manifest is unreadable" in capsys.readouterr().out
+    assert verified == []
+
+
+def test_manifest_from_different_run_fails_and_names_old_dump(monkeypatch, tmp_path, capsys):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    old_dump = "hram_db_2026-09-21T102500Z.sql.gz"
+    current_dump = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{old_dump}\n", encoding="utf-8")
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [current_dump])
+
+    assert vb.main() == 1
+    assert old_dump in capsys.readouterr().out
+
+
+def test_manifest_named_corrupt_dump_still_fails_gzip_check(monkeypatch, tmp_path, capsys):
+    snapshot_time = datetime(2026, 9, 22, 10, 30, tzinfo=timezone.utc)
+    dump = "hram_db_2026-09-22T102500Z.sql.gz"
+    manifest = tmp_path / ".last_run_dumps"
+    manifest.write_text(f"{dump}\n", encoding="utf-8")
+
+    monkeypatch.setattr(vb, "LAST_RUN_DUMPS_FILE", manifest, raising=False)
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [dump])
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: (_ for _ in ()).throw(RuntimeError("gzip integrity check failed")),
+    )
+
+    assert vb.main() == 1
+    assert "gzip integrity check failed" in capsys.readouterr().out

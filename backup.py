@@ -39,6 +39,7 @@ GENERATE_PATHS_SCRIPT = SCRIPTS_DIR / "generate_paths.py"
 # script): the B2 snapshot this run just created, so verification checks THIS
 # snapshot instead of re-discovering "newest in the repo" (INF-17).
 LAST_B2_SNAPSHOT_ID_FILE = Path("/srv/backups/.last_b2_snapshot_id")
+LAST_RUN_DUMPS_FILE = Path("/srv/backups/.last_run_dumps")
 
 RESTIC_BIN = os.environ.get("RESTIC_BIN_OVERRIDE") or shutil.which("restic") or "/usr/bin/restic"
 DEBUG = os.environ.get("DEBUG") == "1"
@@ -199,7 +200,7 @@ def utc_timestamp_str(now: Optional[datetime.datetime] = None) -> str:
     return now.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
 
 
-def perform_db_dumps() -> None:
+def perform_db_dumps() -> List[str]:
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=2)).timestamp()
     for f in DUMP_DIR.glob("*.sql.gz"):
         if f.stat().st_mtime < cutoff:
@@ -217,6 +218,7 @@ def perform_db_dumps() -> None:
 
     log(f"Dump targets: {len(targets)}")
     success_count = 0
+    dump_filenames: List[str] = []
 
     for t in targets:
         safe_name = t["name"].replace("@", "_").replace("/", "_")
@@ -258,6 +260,7 @@ def perform_db_dumps() -> None:
             size_kib = outfile.stat().st_size // 1024
             log(f"Dump OK: {t['name']} / {t['db']} ({size_kib} KiB)")
             success_count += 1
+            dump_filenames.append(outfile.name)
 
         except Exception as e:
             log(f"Dump FAILED: {t['name']} / {t['db']}")
@@ -277,6 +280,7 @@ def perform_db_dumps() -> None:
         fail(f"Not all databases dumped successfully ({success_count}/{len(targets)}).")
 
     log(f"Dumps OK: {success_count}/{len(targets)}")
+    return dump_filenames
 
 
 def restic_repo_ready(env: Dict[str, str], repo_name: str) -> None:
@@ -389,6 +393,17 @@ def record_b2_snapshot(snap_id: Optional[str]) -> None:
             f"{LAST_B2_SNAPSHOT_ID_FILE} left unchanged.")
 
 
+def record_run_dumps(dump_filenames: List[str]) -> None:
+    """Persist the dump filenames completed by this run for verify_backup.py."""
+    contents = "\n".join(dump_filenames) + ("\n" if dump_filenames else "")
+    try:
+        LAST_RUN_DUMPS_FILE.write_text(contents, encoding="utf-8")
+    except OSError as exc:
+        log(f"WARN: could not write {LAST_RUN_DUMPS_FILE} ({exc})")
+    else:
+        log(f"RUN_DUMPS_RECORDED={len(dump_filenames)}")
+
+
 def main() -> None:
     global DOCKER_CMD
 
@@ -398,12 +413,23 @@ def main() -> None:
     ensure_restic_available()
 
     generate_paths_file()
-    perform_db_dumps()
+    dump_filenames = perform_db_dumps()
 
     ok_local, snap_local = run_restic(RESTIC_REPO_LOCAL, "Local", unlock_stale=True)
     ok_b2, snap_b2 = run_restic(RESTIC_REPO_B2, "B2")
 
     record_b2_snapshot(snap_b2)
+    if snap_b2:
+        # R1 (review finding, WM-OPS-9): gate the dump manifest on the SAME condition as the
+        # snapshot-id marker (a real B2 snapshot was created), not unconditionally at dump time.
+        # Without this, a B2 failure could leave LAST_B2_SNAPSHOT_ID_FILE pointing at an OLDER
+        # snapshot while LAST_RUN_DUMPS_FILE had already been overwritten with THIS run's
+        # filenames -- desynced markers that verify_backup.py has no independent way to detect
+        # (this run's snapshot is the one that failed to exist; a coincidental filename collision
+        # with a truly stale manifest would be exactly the silent partial-verification failure
+        # this WO exists to close). Tying both writes to `snap_b2` keeps them staying stale, or
+        # both refreshing, together.
+        record_run_dumps(dump_filenames)
 
     if not ok_local or not ok_b2:
         fail("Restic backup failed for one or more repositories.")
