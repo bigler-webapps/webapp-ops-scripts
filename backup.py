@@ -213,7 +213,6 @@ def perform_db_dumps() -> None:
     except FileNotFoundError as exc:
         fail(f"Cannot prepare dump directory '{DUMP_DIR}'. Ensure /srv/backups exists. ({exc})")
 
-    timestamp = utc_timestamp_str()
     targets = discover_docker_targets()
 
     log(f"Dump targets: {len(targets)}")
@@ -221,8 +220,8 @@ def perform_db_dumps() -> None:
 
     for t in targets:
         safe_name = t["name"].replace("@", "_").replace("/", "_")
-        outfile = DUMP_DIR / f"{safe_name}_{t['db']}_{timestamp}.sql.gz"
-        tmpfile = outfile.with_suffix(outfile.suffix + ".tmp")
+        tmpfile = DUMP_DIR / f"{safe_name}_{t['db']}_{t['id']}.sql.gz.tmp"
+        outfile: Optional[Path] = None
 
         docker_dump_cmd = DOCKER_CMD + ["exec", "-i", t["id"], "pg_dump", "-U", t["user"], t["db"]]
 
@@ -251,6 +250,8 @@ def perform_db_dumps() -> None:
             if not ok:
                 raise RuntimeError(f"gzip integrity check failed: {stderr.strip()}")
 
+            completion_timestamp = utc_timestamp_str()
+            outfile = DUMP_DIR / f"{safe_name}_{t['db']}_{completion_timestamp}.sql.gz"
             os.replace(tmpfile, outfile)
             os.chmod(outfile, 0o600)
 
@@ -267,7 +268,7 @@ def perform_db_dumps() -> None:
 
             if tmpfile.exists():
                 tmpfile.unlink()
-            if outfile.exists():
+            if outfile is not None and outfile.exists():
                 outfile.unlink()
 
             fail("Database dump failed, aborting backup.")

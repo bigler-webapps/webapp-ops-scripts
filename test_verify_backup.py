@@ -82,6 +82,94 @@ def test_legacy_colon_timestamp_format_still_parses():
     assert ts == datetime(2025, 11, 20, 22, 6, 7, tzinfo=timezone.utc)
 
 
+def test_snapshot_with_only_legacy_formats_selects_both(monkeypatch):
+    snapshot_time = datetime(2025, 11, 20, 22, 6, 30, tzinfo=timezone.utc)
+    files = [
+        "app_db_2025-11-20T220600Z.sql.gz",
+        "other_db_2025-11-20T22:06:07Z.sql.gz",
+    ]
+    verified = []
+
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: files)
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 0
+    assert verified == files
+
+
+def test_genuinely_stale_dump_is_rejected(monkeypatch):
+    snapshot_time = datetime(2026, 9, 21, 8, 18, 42, tzinfo=timezone.utc)
+    stale_file = "research-prod_hram_2026-09-21T070000Z.sql.gz"
+    verified = []
+
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [stale_file])
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 1
+    assert verified == []
+
+
+def test_mixed_snapshot_verifies_only_the_fresh_dump_not_the_stale_one(monkeypatch):
+    # R1 (review finding, WM-OPS-7): a same-snapshot mix of one fresh and one stale dump is the
+    # case that would catch the explicitly REJECTED fix (widening MAX_SNAPSHOT_WINDOW_HOURS) --
+    # the existing single-dump stale/fresh tests each pass a widened window just as easily as the
+    # correct per-dump-timestamp fix, since there is no other file in the snapshot to wrongly pull
+    # in. The stale file here is 20 minutes old: well outside the real 0.2h (12min) default window,
+    # but well INSIDE a window someone widened to "fix" WM-OPS-7 the rejected way.
+    snapshot_time = datetime(2026, 9, 21, 8, 18, 42, tzinfo=timezone.utc)
+    fresh_file = "research-prod_hram_2026-09-21T081500Z.sql.gz"
+    stale_file = "research-prod_hram_2026-09-21T075800Z.sql.gz"
+    verified = []
+
+    monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
+    monkeypatch.setattr(vb, "REPO_PWD", "password")
+    monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
+    monkeypatch.setattr(vb.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
+    monkeypatch.setattr(vb, "read_snapshot_id_file", lambda path: "snap123")
+    monkeypatch.setattr(
+        vb,
+        "get_target_snapshot",
+        lambda env, host, explicit_id: ("snap123", snapshot_time.isoformat()),
+    )
+    monkeypatch.setattr(vb, "list_sql_gz_files", lambda env, snapshot_id: [fresh_file, stale_file])
+    monkeypatch.setattr(
+        vb,
+        "verify_gzip_stream_from_restic",
+        lambda env, snapshot_id, path: verified.append(path),
+    )
+
+    assert vb.main() == 0
+    assert verified == [fresh_file]
+
+
 def test_read_snapshot_id_file_missing_returns_none(tmp_path):
     assert vb.read_snapshot_id_file(tmp_path / "does-not-exist") is None
 
