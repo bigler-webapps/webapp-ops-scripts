@@ -67,3 +67,9 @@ tests in Linux plus focused Windows transport tests and a synthetic-only actual 
 a real Windows console, using the corrected helper. Review required before source commit/push.
 Record this regression of a156810 (previous four-lens Luna review missed interactive SSH/PTY
 coverage). Publish the corrected script and usage, not a production copy; operator reruns apply.
+
+Completed execution evidence: [validation](OPS-REC-2-validation.md). Native initial author
+`/root/recover_terminal_fix`, requested gpt-6-luna/high, effective metadata unexposed. Parent
+Windows/Linux tests, actual synthetic console transports and source preflight all pass.
+All four independent configured Luna/medium readonly review processes exited 0, zero findings;
+their effective metadata was verified. No source changes after review; no production mutation.

@@ -36,6 +36,16 @@ so symlink replacement cannot redirect the writes outside the media tree. A chan
 source or failed destination operation stops the run; files already completed remain
 valid and are skipped on the next run.
 
+Every SSH invocation disables pseudo-terminal allocation with `-T`. This matters when
+the script runs from a Windows console: a PTY can convert LF bytes in the source stream
+to CRLF, causing the size or SHA-256 check to fail before destination publication.
+The recovery attempt reported on 2026-10-15 stopped at that source checksum check, with
+zero files copied. After installing this correction, rerun the default read-only
+preflight and inspect its current missing-file list and hashes. If that output is
+expected and the operator has authorized production writes, run the command again with
+`--apply`; the script recalculates the missing set and verifies every transferred file
+before publishing it.
+
 Destination writes use Docker's configured execution user. Innoservice's deployed
 image declares `USER deploy` and launches Daphne directly as that user, so the
 helper and application use the same identity; the script does not override it to root.

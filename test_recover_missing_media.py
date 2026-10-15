@@ -176,6 +176,16 @@ class AtomicPublishTests(unittest.TestCase):
 
 
 class CommandConstructionTests(unittest.TestCase):
+    def test_ssh_command_disables_terminal_for_both_fixed_aliases(self):
+        for alias in (recovery.SOURCE_ALIAS, recovery.TARGET_ALIAS):
+            with self.subTest(alias=alias):
+                command = recovery.ssh_command(alias, "printf remote-output")
+                self.assertEqual(command[:2], ["ssh", "-T"])
+                self.assertEqual(command[-2:], [alias, "printf remote-output"])
+                self.assertIn("BatchMode=yes", command)
+                self.assertIn("ConnectTimeout=10", command)
+                self.assertIn("RemoteCommand=none", command)
+
     def test_hostile_path_is_data_and_never_in_remote_command(self):
         hostile = "private/x'; touch /tmp/pwned; ' .jpg"
         cmd = recovery.target_publish_command(
@@ -189,6 +199,54 @@ class CommandConstructionTests(unittest.TestCase):
 
 
 class RecoveryFlowTests(unittest.TestCase):
+    def test_binary_transfer_stays_exact_through_terminal_sensitive_transport(self):
+        payload = b"lf\ncrlf\r\nnull\x00high\xff\xc3\xa9\n"
+        item = {
+            "path": "private/binary.dat",
+            "size": len(payload),
+            "sha256": recovery.sha256_bytes(payload),
+        }
+        inventory = {
+            "media_root": "/media",
+            "references": 1,
+            "missing": [item["path"]],
+        }
+        transferred = {"source_stdout": None, "destination_stdin": None}
+
+        def terminal_sensitive_transport(command, **kwargs):
+            # Model a PTY's text-mode line-ending conversion. The selected
+            # behavior comes from the actual SSH arguments under test.
+            pty_requested = "-T" not in command
+            if command[-2] == recovery.SOURCE_ALIAS:
+                received = payload.replace(b"\n", b"\r\n") if pty_requested else payload
+                transferred["source_stdout"] = received
+                return SimpleNamespace(returncode=0, stdout=received, stderr=b"")
+            self.assertEqual(command[-2], recovery.TARGET_ALIAS)
+            received = kwargs["input"]
+            transferred["destination_stdin"] = (
+                received.replace(b"\n", b"\r\n") if pty_requested else received
+            )
+            return SimpleNamespace(returncode=0, stdout=b"copied\n", stderr=b"")
+
+        with mock.patch.object(recovery, "query_target", return_value=inventory), \
+                mock.patch.object(recovery, "preflight_source", return_value=[item]), \
+                mock.patch.object(recovery.subprocess, "run", side_effect=terminal_sensitive_transport), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(recovery.main(["--apply"]), 0)
+
+        self.assertEqual(transferred["source_stdout"], payload)
+        self.assertEqual(transferred["destination_stdin"], payload)
+        self.assertEqual(recovery.sha256_bytes(transferred["source_stdout"]), item["sha256"])
+        self.assertEqual(recovery.sha256_bytes(transferred["destination_stdin"]), item["sha256"])
+
+        # A changed source is rejected before the destination subprocess runs.
+        changed = dict(item, sha256=recovery.sha256_bytes(b"different"))
+        with mock.patch.object(recovery, "read_source", return_value=payload), \
+                mock.patch.object(recovery.subprocess, "run") as run:
+            with self.assertRaisesRegex(recovery.RecoveryError, "source changed after preflight"):
+                recovery.publish_target(changed, "/media")
+            run.assert_not_called()
+
     def test_successful_apply_uses_real_helpers_and_preserves_existing_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

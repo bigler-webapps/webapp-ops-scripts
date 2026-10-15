@@ -24,7 +24,7 @@ SOURCE_VOLUME = "innoservice_prod_media_volume"
 TARGET_CONTAINER = "innoservice_production-backend-1"
 APPS = ("measurements", "inspection", "structures", "protocols", "bills", "people")
 JSON_MARKER = "__RECOVER_MEDIA_JSON__:"
-SSH_BASE = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "RemoteCommand=none")
+SSH_BASE = ("ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "RemoteCommand=none")
 
 
 class RecoveryError(Exception):
