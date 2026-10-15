@@ -116,3 +116,11 @@ transport and publication safety. No UI review; no auth/permission logic changes
 Finalize script readiness only on clean independent review and scoped tests. Commit/push own
 files to webapp-ops-scripts/main; no deployment is triggered by this source addition. The
 production recovery remains unexecuted and needs its separate operator-controlled run.
+
+Execution record, 2026-10-15: initial native worker `/root/recover_media_initial`, requested
+gpt-6-luna/high; effective native metadata unexposed. Parent integrated descriptor-based path
+hardening and review fixes. Final authoritative local Linux run: 23 tests passed, zero skips;
+Windows CLI help exit 0. Four final independent CLI lenses verified as gpt-6-luna/medium with
+read-only sandbox and exit 0. Ten distinct review concerns, seven accepted/fixed and three
+rejected with evidence, zero open; worst accepted: defect. See
+[validation and dispositions](OPS-REC-1-validation.md). No production run performed.
