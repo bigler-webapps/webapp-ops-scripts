@@ -6,6 +6,8 @@ import argparse
 import subprocess
 import shutil
 import signal
+import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -98,13 +100,84 @@ def find_db_container_id(project_candidates):
     return "", ""
 
 
+class ContainerStartWatcher:
+    """Collects the container create/start events of one compose project while it runs.
+
+    The daemon's own event history is a 256 entry ring buffer, and on a host with
+    healthchecks that is a quarter of an hour at best, shorter than an import. A
+    listener started before the window covers all of it, and it sees a container
+    that was started and removed again (`docker compose run --rm`), which a
+    comparison of container states cannot.
+
+    Best effort: if the listener cannot be started or dies, that is reported once
+    and the state comparison stands on its own.
+    """
+
+    def __init__(self, project: str):
+        self._project = project
+        self._out = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self._proc = None
+        self._warned = False
+        try:
+            self._proc = subprocess.Popen(
+                [
+                    "docker", "events",
+                    "--since", str(int(time.time())),
+                    "--filter", f"label=com.docker.compose.project={project}",
+                    "--filter", "type=container",
+                    "--filter", "event=create", "--filter", "event=start",
+                    "--format", "{{.Actor.ID}} {{.Actor.Attributes.name}}",
+                ],
+                stdout=self._out,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as exc:
+            self._warn(f"could not start the Docker events listener: {exc}")
+
+    def _warn(self, reason: str) -> None:
+        if not self._warned:
+            self._warned = True
+            log(f"WARNING: {reason}; checking container state only for '{self._project}'.")
+
+    def started(self) -> list:
+        """(container id, name) for every create/start seen since the watcher began."""
+        if self._proc is None:
+            return []
+        if self._proc.poll() is not None and self._proc.returncode != 0:
+            self._warn("the Docker events listener exited early")
+            return []
+        self._out.flush()
+        self._out.seek(0)
+        seen = []
+        for line in self._out.read().splitlines():
+            cid, _, name = line.strip().partition(" ")
+            if cid:
+                seen.append((cid, name))
+        return seen
+
+    def close(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._out.close()
+
+
 @contextmanager
-def application_services_stopped(project: str, db_container_id: str):
+def application_services_stopped(
+    project: str,
+    db_container_id: str,
+    restart_on_error: bool = True,
+    start_left_stopped: bool = False,
+):
     """Stop the running non-database containers in one compose project.
 
     Three properties this must hold, each of them a review finding:
 
-    * The restart survives every exit path (INF-33 R1). SIGTERM is the realistic
+    * For modes that restart, the restart survives every exit path (INF-33 R1). SIGTERM is the realistic
       one for a CI-invoked script -- Python's default disposition terminates
       without unwinding, so `finally` would never run and the application would
       stay down. A handler that raises turns it into a normal unwind. SIGKILL
@@ -120,28 +193,91 @@ def application_services_stopped(project: str, db_container_id: str):
       blind. Deliberately NOT solved by adding that fallback here: `docker ps -f
       name=` is a substring match and would let one project's stop reach
       another's containers. Disagreement is reported instead of papered over.
+
+    `restart_on_error=False` leaves import-only failures stopped and asks for
+    the refresh repair; the default preserves the in-place restart behavior.
+    `start_left_stopped=True` makes a successful run also start the services an
+    earlier failed import left stopped (restart policy other than "no"), so the
+    next import repairs the application instead of leaving it down.
+    The helper snapshots every labelled project container before stopping and
+    checks running state and StartedAt after a normal body exit, and reads the
+    Docker events for any create or start in the window. Together they detect a
+    start during the window, including a container that started and exited, or
+    started and was removed again.
     """
-    result = run_cmd([
-        "docker", "ps", "-q",
-        "-f", f"label=com.docker.compose.project={project}",
-    ])
-    labelled_ids = [cid.strip() for cid in result.stdout.splitlines() if cid.strip()]
-    application_container_ids = [cid for cid in labelled_ids if cid != db_container_id]
+    def _container_states():
+        """State of every labelled container, running or not, keyed by the SHORT id.
 
-    if not application_container_ids:
-        if db_container_id and db_container_id not in labelled_ids:
-            log(
-                f"ERROR: The database container was resolved for compose project "
-                f"'{project}', but a label lookup for that project returns no such "
-                f"container. Application containers cannot be identified reliably, so "
-                f"live writers may survive the import (INF-33). Refusing to continue."
-            )
-            sys.exit(1)
+        `docker ps -q` (which is where `db_container_id` comes from) prints the 12
+        character id while `docker inspect` reports the full one, so the inspected
+        containers are mapped back onto the short ids; keying by the full id would
+        never match the database container.
+        """
+        result = run_cmd([
+            "docker", "ps", "-a", "-q",
+            "-f", f"label=com.docker.compose.project={project}",
+        ])
+        ids = [cid.strip() for cid in result.stdout.splitlines() if cid.strip()]
+        if not ids:
+            return {}
+        inspected = json.loads(run_cmd(["docker", "inspect", *ids]).stdout)
+        states = {}
+        for item in inspected:
+            full_id = item.get("Id") or ""
+            short_id = next((cid for cid in ids if full_id.startswith(cid)), None)
+            if short_id is None:
+                continue
+            states[short_id] = {
+                "name": (item.get("Name") or full_id or "unknown").lstrip("/"),
+                "running": bool(item.get("State", {}).get("Running")),
+                "started_at": item.get("State", {}).get("StartedAt"),
+                "restart_policy": (
+                    (item.get("HostConfig") or {}).get("RestartPolicy", {}).get("Name") or "no"
+                ),
+            }
+        return states
+
+    baseline_all = _container_states()
+    if db_container_id and db_container_id not in baseline_all:
+        log(
+            f"ERROR: The database container was resolved for compose project "
+            f"'{project}', but a label lookup for that project returns no such "
+            f"container. Application containers cannot be identified reliably, so "
+            f"live writers may survive the import (INF-33). Refusing to continue."
+        )
+        sys.exit(1)
+    baseline = {cid: state for cid, state in baseline_all.items() if cid != db_container_id}
+    application_container_ids = [
+        cid for cid, state in baseline.items() if state["running"]
+    ]
+    if application_container_ids:
+        log(f"-> Stopping application services for compose project '{project}'...")
+    else:
         log(f"-> No running application services to stop for compose project '{project}'.")
-        yield
-        return
 
-    log(f"-> Stopping application services for compose project '{project}'...")
+    def _current_application_states():
+        return {
+            cid: state for cid, state in _container_states().items()
+            if cid != db_container_id
+        }
+
+    def _window_violations(current):
+        """Names of application containers that ran, or run, since the baseline."""
+        names = {
+            state["name"]
+            for cid, state in current.items()
+            if cid not in baseline
+            or state["running"]
+            or state["started_at"] != baseline[cid]["started_at"]
+        }
+        for cid, name in watcher.started():
+            if db_container_id and cid.startswith(db_container_id):
+                continue
+            names.add(name or cid[:12])
+        if not names:
+            return ""
+        return f"application container(s) ran during the import window: {', '.join(sorted(names))}"
+
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
     def _raise_on_sigterm(signum, frame):
@@ -150,26 +286,81 @@ def application_services_stopped(project: str, db_container_id: str):
     try:
         signal.signal(signal.SIGTERM, _raise_on_sigterm)
     except ValueError:
-        # Not on the main thread; the handler is a best-effort guard, not a
-        # precondition for the restart itself.
+        # Not on the main thread; the handler is a best-effort guard.
         previous_sigterm_handler = None
 
+    # What a successful run starts again. Import-only (start_left_stopped) also
+    # starts the services an earlier failed import left stopped, which is what lets
+    # the next refresh repair the application; a restart policy of "no" marks the
+    # one-shot init containers, which are never started this way.
+    containers_to_start = list(application_container_ids)
+    if start_left_stopped:
+        containers_to_start += [
+            cid for cid, state in baseline.items()
+            if not state["running"] and state["restart_policy"] != "no"
+        ]
+
+    body_succeeded = False
+    window_open = False
+    watcher = ContainerStartWatcher(project)
     try:
-        run_cmd(["docker", "stop", *application_container_ids])
+        if application_container_ids:
+            run_cmd(["docker", "stop", *application_container_ids])
+        window_open = True
         yield
+
+        violations = _window_violations(_current_application_states())
+        if violations:
+            raise RuntimeError(f"IMPORT_WINDOW_VIOLATION: {violations}")
+        body_succeeded = True
     finally:
-        log(f"-> Starting application services for compose project '{project}'...")
-        restart = run_cmd(["docker", "start", *application_container_ids], check=False)
-        if restart.returncode != 0:
-            # Loud, but non-raising: an exception here would replace whatever sent
-            # us into `finally` in the first place.
+        if not body_succeeded and not restart_on_error:
             log(
-                f"ERROR: Failed to restart application services for compose project "
-                f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
-                f"attention: docker start {' '.join(application_container_ids)}"
+                "IMPORT_FAILED_APP_STOPPED: The import failed; the application is "
+                "being left stopped and needs the refresh repair."
             )
-            if restart.stderr.strip():
-                log(restart.stderr.strip())
+            try:
+                current = _current_application_states()
+                # The import's own error stays the primary one; this names the
+                # cause when something started the application during the window.
+                violations = _window_violations(current) if window_open else ""
+                if violations:
+                    log(f"IMPORT_WINDOW_VIOLATION: {violations}")
+                running_ids = [cid for cid, state in current.items() if state["running"]]
+                if running_ids:
+                    stopped = run_cmd(["docker", "stop", *running_ids], check=False)
+                    if stopped.returncode != 0:
+                        log(
+                            f"ERROR: IMPORT_FAILED_APP_STILL_RUNNING: could not stop "
+                            f"{' '.join(running_ids)} after the failed import; the "
+                            f"application may be serving a half-imported database."
+                        )
+                        if stopped.stderr.strip():
+                            log(stopped.stderr.strip())
+            except BaseException as stop_error:
+                log(
+                    f"ERROR: IMPORT_FAILED_APP_STILL_RUNNING: the post-failure check or "
+                    f"stop failed: {stop_error}"
+                )
+        elif containers_to_start:
+            log(f"-> Starting application services for compose project '{project}'...")
+            try:
+                restart = run_cmd(["docker", "start", *containers_to_start], check=False)
+                if restart.returncode != 0:
+                    log(
+                        f"ERROR: Failed to restart application services for compose project "
+                        f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
+                        f"attention: docker start {' '.join(containers_to_start)}"
+                    )
+                    if restart.stderr.strip():
+                        log(restart.stderr.strip())
+            except BaseException as restart_error:
+                log(
+                    f"ERROR: Failed to restart application services for compose project "
+                    f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
+                    f"attention: {restart_error}"
+                )
+        watcher.close()
         if previous_sigterm_handler is not None:
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
@@ -546,7 +737,12 @@ def mode_import_only(args):
         sys.exit(1)
 
     try:
-        with application_services_stopped(matched_project, db_container_id):
+        with application_services_stopped(
+            matched_project,
+            db_container_id,
+            restart_on_error=False,
+            start_left_stopped=True,
+        ):
             reset_database(db_container_id, db_user, db_name)
             stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name)
     except Exception as e:
