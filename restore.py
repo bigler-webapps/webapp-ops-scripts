@@ -8,9 +8,12 @@ import shutil
 import signal
 import tempfile
 import time
-from contextlib import contextmanager
+import uuid
+import contextlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import stack_recovery
 
 RESTIC_BIN = os.environ.get("RESTIC_BIN_OVERRIDE") or shutil.which("restic") or "/usr/bin/restic"
 DEBUG = os.environ.get("DEBUG") == "1"
@@ -100,6 +103,19 @@ def find_db_container_id(project_candidates):
     return "", ""
 
 
+def resolve_target_database(app: str, target_env: str):
+    """Resolve the local, labelled destination DB after receiver authorization."""
+    require_known_env(target_env, "--target-env")
+    projects = candidate_projects(app, target_env)
+    container_id, project = find_db_container_id(projects)
+    if not container_id:
+        raise RuntimeError("authorized destination database was not found")
+    db_user, db_name = get_db_credentials(container_id)
+    if not db_user or not db_name:
+        raise RuntimeError("destination database labels are incomplete")
+    return project, container_id, db_user, db_name
+
+
 class ContainerStartWatcher:
     """Collects the container create/start events of one compose project while it runs.
 
@@ -164,205 +180,6 @@ class ContainerStartWatcher:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._out.close()
-
-
-@contextmanager
-def application_services_stopped(
-    project: str,
-    db_container_id: str,
-    restart_on_error: bool = True,
-    start_left_stopped: bool = False,
-):
-    """Stop the running non-database containers in one compose project.
-
-    Three properties this must hold, each of them a review finding:
-
-    * For modes that restart, the restart survives every exit path (INF-33 R1). SIGTERM is the realistic
-      one for a CI-invoked script -- Python's default disposition terminates
-      without unwinding, so `finally` would never run and the application would
-      stay down. A handler that raises turns it into a normal unwind. SIGKILL
-      remains uncatchable; nothing can cover that.
-    * A failing restart must not eat the original error (INF-33 R2/S2).
-      `run_cmd` exits via `sys.exit`, i.e. `SystemExit`, which is NOT caught by
-      the callers' `except Exception` -- a raise from inside `finally` would
-      replace the real failure and suppress its message entirely. The restart is
-      therefore best-effort and loud.
-    * Finding nothing is not the same as there being nothing (INF-33 R3).
-      `find_compose_container` falls back to a name match when the compose label
-      is absent, so a label-only lookup that comes back empty may simply be
-      blind. Deliberately NOT solved by adding that fallback here: `docker ps -f
-      name=` is a substring match and would let one project's stop reach
-      another's containers. Disagreement is reported instead of papered over.
-
-    `restart_on_error=False` leaves import-only failures stopped and asks for
-    the refresh repair; the default preserves the in-place restart behavior.
-    `start_left_stopped=True` makes a successful run also start the services an
-    earlier failed import left stopped (restart policy other than "no"), so the
-    next import repairs the application instead of leaving it down.
-    The helper snapshots every labelled project container before stopping and
-    checks running state and StartedAt after a normal body exit, and reads the
-    Docker events for any create or start in the window. Together they detect a
-    start during the window, including a container that started and exited, or
-    started and was removed again.
-    """
-    def _container_states():
-        """State of every labelled container, running or not, keyed by the SHORT id.
-
-        `docker ps -q` (which is where `db_container_id` comes from) prints the 12
-        character id while `docker inspect` reports the full one, so the inspected
-        containers are mapped back onto the short ids; keying by the full id would
-        never match the database container.
-        """
-        result = run_cmd([
-            "docker", "ps", "-a", "-q",
-            "-f", f"label=com.docker.compose.project={project}",
-        ])
-        ids = [cid.strip() for cid in result.stdout.splitlines() if cid.strip()]
-        if not ids:
-            return {}
-        inspected = json.loads(run_cmd(["docker", "inspect", *ids]).stdout)
-        states = {}
-        for item in inspected:
-            full_id = item.get("Id") or ""
-            short_id = next((cid for cid in ids if full_id.startswith(cid)), None)
-            if short_id is None:
-                continue
-            states[short_id] = {
-                "name": (item.get("Name") or full_id or "unknown").lstrip("/"),
-                "running": bool(item.get("State", {}).get("Running")),
-                "started_at": item.get("State", {}).get("StartedAt"),
-                "restart_policy": (
-                    (item.get("HostConfig") or {}).get("RestartPolicy", {}).get("Name") or "no"
-                ),
-            }
-        return states
-
-    baseline_all = _container_states()
-    if db_container_id and db_container_id not in baseline_all:
-        log(
-            f"ERROR: The database container was resolved for compose project "
-            f"'{project}', but a label lookup for that project returns no such "
-            f"container. Application containers cannot be identified reliably, so "
-            f"live writers may survive the import (INF-33). Refusing to continue."
-        )
-        sys.exit(1)
-    baseline = {cid: state for cid, state in baseline_all.items() if cid != db_container_id}
-    application_container_ids = [
-        cid for cid, state in baseline.items() if state["running"]
-    ]
-    if application_container_ids:
-        log(f"-> Stopping application services for compose project '{project}'...")
-    else:
-        log(f"-> No running application services to stop for compose project '{project}'.")
-
-    def _current_application_states():
-        return {
-            cid: state for cid, state in _container_states().items()
-            if cid != db_container_id
-        }
-
-    def _window_violations(current):
-        """Names of application containers that ran, or run, since the baseline."""
-        names = {
-            state["name"]
-            for cid, state in current.items()
-            if cid not in baseline
-            or state["running"]
-            or state["started_at"] != baseline[cid]["started_at"]
-        }
-        for cid, name in watcher.started():
-            if db_container_id and cid.startswith(db_container_id):
-                continue
-            names.add(name or cid[:12])
-        if not names:
-            return ""
-        return f"application container(s) ran during the import window: {', '.join(sorted(names))}"
-
-    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-
-    def _raise_on_sigterm(signum, frame):
-        raise SystemExit(f"Received signal {signum} while application services were stopped.")
-
-    try:
-        signal.signal(signal.SIGTERM, _raise_on_sigterm)
-    except ValueError:
-        # Not on the main thread; the handler is a best-effort guard.
-        previous_sigterm_handler = None
-
-    # What a successful run starts again. Import-only (start_left_stopped) also
-    # starts the services an earlier failed import left stopped, which is what lets
-    # the next refresh repair the application; a restart policy of "no" marks the
-    # one-shot init containers, which are never started this way.
-    containers_to_start = list(application_container_ids)
-    if start_left_stopped:
-        containers_to_start += [
-            cid for cid, state in baseline.items()
-            if not state["running"] and state["restart_policy"] != "no"
-        ]
-
-    body_succeeded = False
-    window_open = False
-    watcher = ContainerStartWatcher(project)
-    try:
-        if application_container_ids:
-            run_cmd(["docker", "stop", *application_container_ids])
-        window_open = True
-        yield
-
-        violations = _window_violations(_current_application_states())
-        if violations:
-            raise RuntimeError(f"IMPORT_WINDOW_VIOLATION: {violations}")
-        body_succeeded = True
-    finally:
-        if not body_succeeded and not restart_on_error:
-            log(
-                "IMPORT_FAILED_APP_STOPPED: The import failed; the application is "
-                "being left stopped and needs the refresh repair."
-            )
-            try:
-                current = _current_application_states()
-                # The import's own error stays the primary one; this names the
-                # cause when something started the application during the window.
-                violations = _window_violations(current) if window_open else ""
-                if violations:
-                    log(f"IMPORT_WINDOW_VIOLATION: {violations}")
-                running_ids = [cid for cid, state in current.items() if state["running"]]
-                if running_ids:
-                    stopped = run_cmd(["docker", "stop", *running_ids], check=False)
-                    if stopped.returncode != 0:
-                        log(
-                            f"ERROR: IMPORT_FAILED_APP_STILL_RUNNING: could not stop "
-                            f"{' '.join(running_ids)} after the failed import; the "
-                            f"application may be serving a half-imported database."
-                        )
-                        if stopped.stderr.strip():
-                            log(stopped.stderr.strip())
-            except BaseException as stop_error:
-                log(
-                    f"ERROR: IMPORT_FAILED_APP_STILL_RUNNING: the post-failure check or "
-                    f"stop failed: {stop_error}"
-                )
-        elif containers_to_start:
-            log(f"-> Starting application services for compose project '{project}'...")
-            try:
-                restart = run_cmd(["docker", "start", *containers_to_start], check=False)
-                if restart.returncode != 0:
-                    log(
-                        f"ERROR: Failed to restart application services for compose project "
-                        f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
-                        f"attention: docker start {' '.join(containers_to_start)}"
-                    )
-                    if restart.stderr.strip():
-                        log(restart.stderr.strip())
-            except BaseException as restart_error:
-                log(
-                    f"ERROR: Failed to restart application services for compose project "
-                    f"'{project}'. THE APPLICATION IS STILL STOPPED and needs manual "
-                    f"attention: {restart_error}"
-                )
-        watcher.close()
-        if previous_sigterm_handler is not None:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def get_db_credentials(container_id: str):
@@ -447,16 +264,26 @@ def choose_dump_for_db(all_files, db_name: str, snap_time: datetime):
     return candidates[-1][1]
 
 
-def reset_database(db_container_id: str, db_user: str, db_name: str):
+def _psql(tx, db_container_id: str, *args):
+    if tx is None:
+        return run_cmd(["docker", "exec", db_container_id, "psql", *args])
+    child = tx.exec_psql(db_container_id, *args, stdout=subprocess.DEVNULL)
+    if child.wait() != 0:
+        raise RuntimeError("database command failed")
+
+
+def reset_database(db_container_id: str, db_user: str, db_name: str, tx=None):
     log(f"-> Resetting DB '{db_name}' (drop + create)...")
     drop_sql = f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE);'
     create_sql = f'CREATE DATABASE "{db_name}";'
-    run_cmd(["docker", "exec", db_container_id, "psql", "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", drop_sql])
-    run_cmd(["docker", "exec", db_container_id, "psql", "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", create_sql])
+    _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", drop_sql)
+    _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", create_sql)
 
 
-def assert_schema_healthy(db_container_id: str, db_user: str, db_name: str):
+def assert_schema_healthy(db_container_id: str, db_user: str, db_name: str, tx=None):
     """Fail when a restored public base table has no primary key."""
+    if tx is not None:
+        tx.update_phase("checks", "running")
     missing_primary_keys_sql = """
         SELECT format('%I.%I', t.table_schema, t.table_name)
         FROM information_schema.tables AS t
@@ -471,24 +298,46 @@ def assert_schema_healthy(db_container_id: str, db_user: str, db_name: str):
           )
         ORDER BY t.table_schema, t.table_name;
     """
-    result = run_cmd([
+    command = [
         "docker", "exec", db_container_id,
         "psql", "-U", db_user, "-d", db_name,
         "-v", "ON_ERROR_STOP=1", "-Atc", missing_primary_keys_sql,
-    ])
+    ]
+    try:
+        if tx is None:
+            result = run_cmd(command)
+        else:
+            proc = tx.exec_psql(db_container_id, "-U", db_user, "-d", db_name,
+                                "-v", "ON_ERROR_STOP=1", "-Atc", missing_primary_keys_sql,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = proc.communicate()
+            if proc.returncode:
+                raise RuntimeError("schema health check failed")
+            result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    except BaseException:
+        if tx is not None:
+            with contextlib.suppress(Exception):
+                tx.update_phase("checks", "failed", error_code="schema-check-failed")
+        raise
     missing_tables = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if missing_tables:
+        sample = missing_tables[:10]
+        suffix = f" (+{len(missing_tables) - len(sample)} more)" if len(missing_tables) > len(sample) else ""
         log(
             "ERROR: Schema assertion failed: "
             f"{len(missing_tables)} public base table(s) have no primary key: "
-            + ", ".join(missing_tables)
+            + ", ".join(sample) + suffix
         )
+        if tx is not None:
+            tx.update_phase("checks", "failed", error_code="schema-assertion-failed")
         sys.exit(1)
 
+    if tx is not None:
+        tx.update_phase("checks", "completed")
     log("-> Schema assertion passed: every public base table has a primary key.")
 
 
-def stream_restore_into_psql(env: dict, snapshot_id: str, dump_path: str, db_container_id: str, db_user: str, db_name: str):
+def stream_restore_into_psql(env: dict, snapshot_id: str, dump_path: str, db_container_id: str, db_user: str, db_name: str, tx=None):
     log("-> Importing dump (streamed from restic)...")
 
     p_dump = subprocess.Popen(
@@ -506,12 +355,17 @@ def stream_restore_into_psql(env: dict, snapshot_id: str, dump_path: str, db_con
     )
 
     try:
-        subprocess.run(
-            ["docker", "exec", "-i", db_container_id, "psql", "-U", db_user, "-d", db_name, "-v", "ON_ERROR_STOP=1"],
-            stdin=p_gunzip.stdout,
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
+        if tx is None:
+            subprocess.run(
+                ["docker", "exec", "-i", db_container_id, "psql", "-U", db_user, "-d", db_name, "-v", "ON_ERROR_STOP=1"],
+                stdin=p_gunzip.stdout, check=True, stdout=subprocess.DEVNULL,
+            )
+        else:
+            child = tx.exec_psql(db_container_id, "-i", "-U", db_user, "-d", db_name,
+                                 "-v", "ON_ERROR_STOP=1", stdin=p_gunzip.stdout,
+                                 stdout=subprocess.DEVNULL)
+            if child.wait() != 0:
+                raise RuntimeError("database import command failed")
     finally:
         if p_dump.stdout:
             p_dump.stdout.close()
@@ -529,7 +383,7 @@ def stream_restore_into_psql(env: dict, snapshot_id: str, dump_path: str, db_con
         raise RuntimeError(f"gunzip failed: {gz_err}")
 
 
-def stream_restore_from_local_file(dump_file: Path, db_container_id: str, db_user: str, db_name: str):
+def stream_restore_from_local_file(dump_file: Path, db_container_id: str, db_user: str, db_name: str, tx=None):
     log(f"-> Importing dump from local file: {dump_file}")
 
     with dump_file.open("rb") as src:
@@ -541,12 +395,15 @@ def stream_restore_from_local_file(dump_file: Path, db_container_id: str, db_use
         )
 
         try:
-            subprocess.run(
-                ["docker", "exec", "-i", db_container_id, "psql", "-U", db_user, "-d", db_name, "-v", "ON_ERROR_STOP=1"],
-                stdin=p_gunzip.stdout,
-                check=True,
-                stdout=subprocess.DEVNULL,
-            )
+            command = ["docker", "exec", "-i", db_container_id, "psql", "-U", db_user, "-d", db_name, "-v", "ON_ERROR_STOP=1"]
+            if tx is None:
+                subprocess.run(command, stdin=p_gunzip.stdout, check=True, stdout=subprocess.DEVNULL)
+            else:
+                child = tx.exec_psql(db_container_id, "-i", "-U", db_user, "-d", db_name,
+                                     "-v", "ON_ERROR_STOP=1", stdin=p_gunzip.stdout,
+                                     stdout=subprocess.DEVNULL)
+                if child.wait() != 0:
+                    raise RuntimeError("database import command failed")
         finally:
             if p_gunzip.stdout:
                 p_gunzip.stdout.close()
@@ -557,14 +414,34 @@ def stream_restore_from_local_file(dump_file: Path, db_container_id: str, db_use
             raise RuntimeError(f"gunzip failed: {gz_err}")
 
 
-def run_migrations(project: str):
-    be_id = find_compose_container(project, "backend")
-    if not be_id:
-        log("⚠️  Backend container not found. Skipping migrations.")
-        return
+def run_migrations(project: str, tx=None):
     log("-> Running migrations...")
-    subprocess.run(["docker", "exec", "-i", be_id, "python", "manage.py", "migrate", "--noinput"], check=True, stdout=subprocess.DEVNULL)
+    if tx is None:
+        be_id = find_compose_container(project, "backend")
+        if not be_id:
+            raise RuntimeError("backend container not found; required migrations were not run")
+        subprocess.run(["docker", "exec", "-i", be_id, "python", "manage.py", "migrate", "--noinput"],
+                       check=True, stdout=subprocess.DEVNULL)
+    else:
+        tx.update_phase("migration", "running")
+        try:
+            child = tx.run_migrations(stdout=subprocess.DEVNULL)
+            if child.wait() != 0:
+                raise RuntimeError("database migration command failed")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                tx.update_phase("migration", "failed", error_code="migration-failed")
+            raise
+        tx.update_phase("migration", "completed")
     log("✅ Migration successful.")
+
+
+def import_database(tx, dump_file: Path, db_container_id: str, db_user: str, db_name: str) -> None:
+    """Database-only recovery phase for framed receivers; caller owns later phases."""
+    tx.mark_database_started()
+    reset_database(db_container_id, db_user, db_name, tx=tx)
+    stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name, tx=tx)
+    tx.update_phase("database", "completed")
 
 
 def mode_in_place(args):
@@ -604,17 +481,31 @@ def mode_in_place(args):
     dump_path = choose_dump_for_db(all_files, db_name, snap_time)
     log(f"Selected dump for db '{db_name}': {dump_path}")
 
+    operation_id = getattr(args, "operation_id", None) or uuid.uuid4().hex
+    tx_context = stack_recovery.RecoveryTransaction(
+        matched_project, args.app, operation_id, getattr(args, "recovery_source", None) or "restic",
+        expected_final="preserve", auto_restart=True,
+        origin_run_id=getattr(args, "origin_run_id", None),
+        origin_attempt=getattr(args, "origin_attempt", None),
+    )
     try:
-        with application_services_stopped(matched_project, db_container_id):
-            reset_database(db_container_id, db_user, db_name)
-            stream_restore_into_psql(env, snapshot_id, dump_path, db_container_id, db_user, db_name)
+        with tx_context as tx:
+            if tx.already_completed:
+                log(stack_recovery.recovery_result(tx.record))
+                return 0
+            tx.mark_database_started()
+            reset_database(db_container_id, db_user, db_name, tx=tx)
+            stream_restore_into_psql(env, snapshot_id, dump_path, db_container_id, db_user, db_name, tx=tx)
+            tx.update_phase("database", "completed")
+            run_migrations(matched_project, tx=tx)
+            assert_schema_healthy(db_container_id, db_user, db_name, tx=tx)
+            tx.complete(artifacts="not_applicable", migration="completed", checks="completed")
+            log(stack_recovery.recovery_result(tx.record))
     except Exception as e:
-        log(f"ERROR: Import failed: {e}")
+        log(f"ERROR: Import failed ({type(e).__name__}).")
+        if getattr(tx_context, "record", None) is not None:
+            log(stack_recovery.recovery_result(tx_context.record))
         sys.exit(1)
-
-    # Migrations require the backend container, so the application is restarted first.
-    run_migrations(matched_project)
-    assert_schema_healthy(db_container_id, db_user, db_name)
 
     log(f"✅ App {args.app} successfully restored to staging.")
     return 0
@@ -736,24 +627,34 @@ def mode_import_only(args):
         log("ERROR: Target DB container is missing backup.pg.user / backup.pg.db labels.")
         sys.exit(1)
 
+    operation_id = getattr(args, "operation_id", None) or uuid.uuid4().hex
+    recovery_source = getattr(args, "recovery_source", None) or "manual"
+    auto_restart = bool(getattr(args, "auto_restart", False))
+    tx_context = stack_recovery.RecoveryTransaction(
+        matched_project, args.app, operation_id, recovery_source,
+        expected_final="preserve" if auto_restart else "stopped",
+        auto_restart=auto_restart,
+        restart_left_stopped=bool(getattr(args, "restart_left_stopped", False)),
+        origin_run_id=getattr(args, "origin_run_id", None),
+        origin_attempt=getattr(args, "origin_attempt", None),
+    )
     try:
-        with application_services_stopped(
-            matched_project,
-            db_container_id,
-            restart_on_error=False,
-            start_left_stopped=True,
-        ):
-            reset_database(db_container_id, db_user, db_name)
-            stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name)
+        with tx_context as tx:
+            if tx.already_completed:
+                log(stack_recovery.recovery_result(tx.record))
+                return 0
+            import_database(tx, dump_file, db_container_id, db_user, db_name)
+            run_migrations(matched_project, tx=tx)
+            assert_schema_healthy(db_container_id, db_user, db_name, tx=tx)
+            tx.complete(artifacts="not_applicable", migration="completed", checks="completed")
+            log(stack_recovery.recovery_result(tx.record))
     except Exception as e:
-        log(f"ERROR: Import failed: {e}")
+        log(f"ERROR: Import failed ({type(e).__name__}).")
+        if getattr(tx_context, "record", None) is not None:
+            log(stack_recovery.recovery_result(tx_context.record))
         sys.exit(1)
 
-    # Migrations require the backend container, so the application is restarted first.
-    run_migrations(matched_project)
-    assert_schema_healthy(db_container_id, db_user, db_name)
-
-    log(f"✅ App {args.app} successfully restored from local dump into {args.target_env}.")
+    log(f"App {args.app} database restore completed for {args.target_env}; observed application state: {tx_context.record.get('application', 'unknown')}.")
     return 0
 
 
@@ -773,6 +674,12 @@ def main():
     parser.add_argument("--snapshot", default="latest", help="Used in in-place and dump-only modes.")
     parser.add_argument("--output-dir", help="Required for dump-only — where to write dump.sql.gz + manifest.json.")
     parser.add_argument("--dump-file", help="Required for import-only — path to a local .sql.gz produced by dump-only.")
+    parser.add_argument("--operation-id", help="Stable recovery correlation ID supplied by an authorized retry.")
+    parser.add_argument("--recovery-source", help="Bound source identity supplied by an authorized receiver.")
+    parser.add_argument("--origin-run-id", help="Stable originating workflow run ID for repair evidence.")
+    parser.add_argument("--origin-attempt", help="Originating workflow attempt number for repair evidence.")
+    parser.add_argument("--auto-restart", action="store_true", help="Explicitly restore eligible application services after all checks pass.")
+    parser.add_argument("--restart-left-stopped", action="store_true", help="Also restart previously stopped non-one-shot services after successful recovery.")
     args = parser.parse_args()
 
     if args.mode == "in-place":

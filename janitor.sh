@@ -96,7 +96,10 @@ echo "== Disk usage (before) =="
 df -h /
 
 echo "== Docker container prune (stopped containers) =="
-docker container prune -f
+# Compose owns recovery state in its stopped containers, including deliberate
+# one-off migration/check containers. Keep those records until their owning
+# workflow or recovery reconciliation removes them.
+docker container prune -f --filter 'label!=com.docker.compose.project'
 
 # Keep the newest N tags of every repository and remove the rest. Two guards
 # matter here and both are deliberate:

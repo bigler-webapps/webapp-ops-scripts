@@ -30,6 +30,12 @@ def test_janitor_never_prunes_volumes():
     assert "volume prune" not in script
 
 
+def test_container_prune_excludes_all_compose_owned_containers_including_oneoffs():
+    script = JANITOR.read_text(encoding="utf-8")
+    assert "docker container prune -f --filter 'label!=com.docker.compose.project'" in script
+    assert "Compose owns recovery state in its stopped containers, including deliberate" in script
+
+
 def test_janitor_reports_docker_and_containerd_storage_for_diagnosis():
     script = JANITOR.read_text(encoding="utf-8")
     assert "docker system df -v" in script
