@@ -117,6 +117,10 @@ def _run_janitor_with_docker_stub(
     buildx_ls_output="",
     volume_ls_output="",
     volume_rm_exit=0,
+    e2e_containers="",
+    e2e_inspects="",
+    proc_root=None,
+    max_age_minutes="400",
 ):
     """Runs the real runner_janitor.sh against a stubbed `docker` on PATH.
     Returns (result, calls) where `calls` is the stub's own invocation log
@@ -135,8 +139,12 @@ def _run_janitor_with_docker_stub(
     log_path = tmp_path / "docker_calls.log"
     buildx_ls_path = tmp_path / "buildx_ls_output.txt"
     volume_ls_path = tmp_path / "volume_ls_output.txt"
+    e2e_containers_path = tmp_path / "e2e_containers.txt"
+    e2e_inspects_path = tmp_path / "e2e_inspects.txt"
     buildx_ls_path.write_text(buildx_ls_output, encoding="utf-8", newline="\n")
     volume_ls_path.write_text(volume_ls_output, encoding="utf-8", newline="\n")
+    e2e_containers_path.write_text(e2e_containers, encoding="utf-8", newline="\n")
+    e2e_inspects_path.write_text(e2e_inspects, encoding="utf-8", newline="\n")
 
     docker_stub = f"""#!/usr/bin/env bash
 LOG="{log_path!s}"
@@ -154,6 +162,26 @@ case "$1 $2" in
     echo "volume rm $3" >> "$LOG"
     exit {volume_rm_exit}
     ;;
+  "ps -a")
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if ! grep -Fxq "container rm -f $name" "$LOG" 2>/dev/null; then echo "$name"; fi
+    done < "{e2e_containers_path!s}"
+    ;;
+  "inspect --type")
+    name="${{!#}}"
+    awk -F'|' -v name="$name" '$1 == name {{ print $2 "|" $3; found=1 }} END {{ if (!found) exit 1 }}' "{e2e_inspects_path!s}"
+    ;;
+  "rm -f")
+    shift 2
+    for name in "$@"; do echo "container rm -f $name" >> "$LOG"; done
+    ;;
+  "network rm")
+    echo "network rm $3" >> "$LOG"
+    ;;
+  "image rm")
+    echo "image rm $4" >> "$LOG"
+    ;;
   *)
     true
     ;;
@@ -166,6 +194,8 @@ exit 0
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["RUNNER_PROC_ROOT"] = str(proc_root if proc_root is not None else tmp_path / "missing-proc")
+    env["E2E_STACK_MAX_AGE_MIN"] = str(max_age_minutes)
 
     result = subprocess.run(
         [BASH, str(RUNNER_JANITOR)],
@@ -176,6 +206,102 @@ exit 0
     )
     calls = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
     return result, calls
+
+
+def _e2e_fixture(tmp_path, run_attempt, age_minutes=10, runner="", worker_slot=None):
+    from datetime import datetime, timedelta, timezone
+
+    created = (datetime.now(timezone.utc) - timedelta(minutes=age_minutes)).isoformat()
+    names = [f"ci-e2e-{kind}-{run_attempt}" for kind in ("db", "redis", "app")]
+    inspect_data = "".join(f"{name}|{created}|{runner}\n" for name in names)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir(exist_ok=True)
+    if worker_slot is not None:
+        worker = proc_root / "1234"
+        worker.mkdir(exist_ok=True)
+        (worker / "cmdline").write_bytes(b"/opt/runner/Runner.Worker.dll\0")
+        (worker / "cgroup").write_text(f"0::/system.slice/gh-runner@{worker_slot}.service\n", encoding="utf-8")
+    return "\n".join(names) + "\nordinary-app-123\n", inspect_data, proc_root
+
+
+def test_runner_janitor_removes_e2e_stack_without_running_worker(tmp_path):
+    names, inspect_data, proc_root = _e2e_fixture(
+        tmp_path, "123-1", runner="netcup-runner-1-slot1"
+    )
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0, result.stderr
+    assert "orphaned: ci-e2e-123-1" in result.stdout
+    assert "container rm -f ci-e2e-app-123-1\n" in calls
+    assert "network rm ci-e2e-net-123-1\n" in calls
+    assert "image rm ci-e2e:123-1\n" in calls
+    assert "ordinary-app-123" not in calls
+
+
+def test_runner_janitor_keeps_e2e_stack_with_running_worker(tmp_path):
+    names, inspect_data, proc_root = _e2e_fixture(
+        tmp_path, "124-1", runner="netcup-runner-1-slot1", worker_slot=1
+    )
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0
+    assert "kept (active): ci-e2e-124-1" in result.stdout
+    assert "ci-e2e-app-124-1" not in calls
+
+
+def test_runner_janitor_removes_labelled_stack_older_than_the_job_cap_even_if_its_slot_is_busy(tmp_path):
+    """A busy slot may be running a LATER job; no job outlives the 360-minute cap, so the old stack is orphaned."""
+    names, inspect_data, proc_root = _e2e_fixture(
+        tmp_path, "126-1", age_minutes=450, runner="netcup-runner-1-slot1", worker_slot=1
+    )
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0, result.stderr
+    assert "orphaned: ci-e2e-126-1" in result.stdout
+    assert "container rm -f ci-e2e-app-126-1" in calls
+
+
+def test_runner_janitor_ages_unlabelled_e2e_stacks_and_second_run_is_noop(tmp_path):
+    names, inspect_data, proc_root = _e2e_fixture(tmp_path, "125-1", age_minutes=450)
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0
+    assert "orphaned: ci-e2e-125-1" in result.stdout
+    assert "container rm -f ci-e2e-app-125-1\n" in calls
+    second, second_calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert second.returncode == 0
+    assert "ci-e2e-125-1" not in second.stdout
+    assert second_calls == calls
+
+
+def test_runner_janitor_keeps_young_unlabelled_e2e_stack(tmp_path):
+    names, inspect_data, proc_root = _e2e_fixture(tmp_path, "126-1", age_minutes=20)
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0
+    assert "kept (active): ci-e2e-126-1" in result.stdout
+    assert "ci-e2e-app-126-1" not in calls
+
+
+def test_runner_janitor_keeps_stack_when_slot_state_is_unknown(tmp_path):
+    names, inspect_data, proc_root = _e2e_fixture(
+        tmp_path, "127-1", age_minutes=10, runner="netcup-runner-1-slot2"
+    )
+    # No cgroup root is a deliberate inability to establish slot state.
+    proc_root = tmp_path / "absent-proc"
+    result, calls = _run_janitor_with_docker_stub(
+        tmp_path, e2e_containers=names, e2e_inspects=inspect_data, proc_root=proc_root
+    )
+    assert result.returncode == 0
+    assert "slot state unknown" in result.stdout
+    assert "ci-e2e-app-127-1" not in calls
 
 
 def _removed(calls, kind, name):

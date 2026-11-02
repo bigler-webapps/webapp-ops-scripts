@@ -22,6 +22,155 @@ set -euo pipefail
 echo "== Disk usage (before) =="
 df -h /
 
+echo "== Orphaned E2E stack cleanup =="
+# E2E jobs leave named app/db/Redis containers, a network and an image on the
+# shared runner daemon. Group strictly by the run-attempt suffix found on the
+# three known container names; never broaden this to a Docker prune.
+E2E_STACK_MAX_AGE_MIN="${E2E_STACK_MAX_AGE_MIN:-400}"
+RUNNER_PROC_ROOT="${RUNNER_PROC_ROOT:-/proc}"
+declare -A e2e_db=() e2e_redis=() e2e_app=() e2e_newest=() e2e_runner=() e2e_bad=() e2e_seen=()
+
+e2e_slot_state() {
+  local runner="$1" slot unit proc cmdline cgroup
+  if [[ ! "$runner" =~ ^netcup-runner-1-slot([0-9]+)$ ]]; then
+    return 2
+  fi
+  slot="${BASH_REMATCH[1]}"
+  unit="gh-runner@${slot}.service"
+  if [[ ! -d "$RUNNER_PROC_ROOT" ]]; then
+    return 2
+  fi
+  for proc in "$RUNNER_PROC_ROOT"/[0-9]*; do
+    [[ -d "$proc" ]] || continue
+    # A process whose command line cannot be read leaves the slot state unknown (a live worker could hide
+    # behind it), and unknown keeps the stack.
+    [[ -r "$proc/cmdline" ]] || return 2
+    cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *Runner.Worker* ]] || continue
+    [[ -r "$proc/cgroup" ]] || return 2
+    cgroup="$(cat "$proc/cgroup" 2>/dev/null || true)"
+    [[ -n "$cgroup" ]] || return 2
+    if grep -Eq "(^|/)$unit([/[:space:]]|$)" <<< "$cgroup"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+now_epoch="$(date +%s)"
+while IFS= read -r container; do
+  [[ "$container" =~ ^ci-e2e-(db|redis|app)-([0-9]+-[0-9]+)$ ]] || continue
+  kind="${BASH_REMATCH[1]}"
+  run_attempt="${BASH_REMATCH[2]}"
+  e2e_seen["$run_attempt"]=1
+  case "$kind" in
+    db) e2e_db["$run_attempt"]="$container" ;;
+    redis) e2e_redis["$run_attempt"]="$container" ;;
+    app) e2e_app["$run_attempt"]="$container" ;;
+  esac
+  inspect="$(docker inspect --type container --format '{{.Created}}|{{index .Config.Labels "ci.e2e.runner"}}' "$container" 2>/dev/null)" || {
+    e2e_bad["$run_attempt"]=1
+    continue
+  }
+  created="${inspect%%|*}"
+  runner="${inspect#*|}"
+  created_epoch="$(date -d "$created" +%s 2>/dev/null)" || {
+    e2e_bad["$run_attempt"]=1
+    continue
+  }
+  if [[ -z "${e2e_newest[$run_attempt]+x}" || "$created_epoch" -gt "${e2e_newest[$run_attempt]}" ]]; then
+    e2e_newest["$run_attempt"]="$created_epoch"
+  fi
+  if [[ -n "$runner" && "$runner" != "<no value>" ]]; then
+    if [[ -n "${e2e_runner[$run_attempt]:-}" && "${e2e_runner[$run_attempt]}" != "$runner" ]]; then
+      e2e_bad["$run_attempt"]=1
+    else
+      e2e_runner["$run_attempt"]="$runner"
+    fi
+  fi
+done < <(docker ps -a --filter 'name=ci-e2e-' --format '{{.Names}}' 2>/dev/null || true)
+
+while IFS= read -r network; do
+  [[ "$network" =~ ^ci-e2e-net-([0-9]+-[0-9]+)$ ]] || continue
+  run_attempt="${BASH_REMATCH[1]}"
+  e2e_seen["$run_attempt"]=1
+  runner="$(docker network inspect --format '{{index .Labels "ci.e2e.runner"}}' "$network" 2>/dev/null)" || {
+    e2e_bad["$run_attempt"]=1
+    continue
+  }
+  if [[ -n "$runner" && "$runner" != "<no value>" ]]; then
+    if [[ -n "${e2e_runner[$run_attempt]:-}" && "${e2e_runner[$run_attempt]}" != "$runner" ]]; then
+      e2e_bad["$run_attempt"]=1
+    else
+      e2e_runner["$run_attempt"]="$runner"
+    fi
+  fi
+done < <(docker network ls --filter 'name=ci-e2e-net-' --format '{{.Name}}' 2>/dev/null || true)
+
+while IFS= read -r image; do
+  [[ "$image" =~ ^ci-e2e:([0-9]+-[0-9]+)$ ]] || continue
+  run_attempt="${BASH_REMATCH[1]}"
+  e2e_seen["$run_attempt"]=1
+  runner="$(docker image inspect --format '{{index .Config.Labels "ci.e2e.runner"}}' "$image" 2>/dev/null)" || {
+    e2e_bad["$run_attempt"]=1
+    continue
+  }
+  if [[ -n "$runner" && "$runner" != "<no value>" ]]; then
+    if [[ -n "${e2e_runner[$run_attempt]:-}" && "${e2e_runner[$run_attempt]}" != "$runner" ]]; then
+      e2e_bad["$run_attempt"]=1
+    else
+      e2e_runner["$run_attempt"]="$runner"
+    fi
+  fi
+done < <(docker image ls --filter 'reference=ci-e2e:*' --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+
+for run_attempt in "${!e2e_seen[@]}"; do
+  reason=""
+  state="unknown"
+  if [[ -n "${e2e_bad[$run_attempt]:-}" ]]; then
+    echo "kept (active): ci-e2e-$run_attempt (stack metadata unavailable)"
+    continue
+  fi
+  runner="${e2e_runner[$run_attempt]:-}"
+  # A job cannot outlive its 360-minute GitHub cap, so a stack older than the bound is orphaned
+  # whatever the slot is doing now (a busy slot may be running a LATER job).
+  if [[ -n "${e2e_newest[$run_attempt]:-}" ]]; then
+    age_minutes="$(( (now_epoch - e2e_newest[$run_attempt]) / 60 ))"
+    if (( age_minutes > E2E_STACK_MAX_AGE_MIN )); then
+      reason="newest container is ${age_minutes}m old"
+    fi
+  fi
+  if [[ -n "$reason" ]]; then
+    :
+  elif [[ -n "$runner" ]]; then
+    e2e_slot_state "$runner" && state="active" || case "$?" in 1) state="inactive" ;; *) state="unknown" ;; esac
+    if [[ "$state" == "active" ]]; then
+      echo "kept (active): ci-e2e-$run_attempt ($runner has Runner.Worker)"
+      continue
+    elif [[ "$state" == "unknown" ]]; then
+      echo "kept (active): ci-e2e-$run_attempt (slot state unknown for $runner)"
+      continue
+    fi
+    reason="slot $runner has no Runner.Worker"
+  else
+    if [[ -z "${e2e_newest[$run_attempt]:-}" ]]; then
+      echo "kept (active): ci-e2e-$run_attempt (no container age available)"
+      continue
+    fi
+    age_minutes="$(( (now_epoch - e2e_newest[$run_attempt]) / 60 ))"
+    if (( age_minutes <= E2E_STACK_MAX_AGE_MIN )); then
+      echo "kept (active): ci-e2e-$run_attempt (unlabelled stack is ${age_minutes}m old)"
+      continue
+    fi
+    reason="newest container is ${age_minutes}m old"
+  fi
+
+  echo "orphaned: ci-e2e-$run_attempt ($reason)"
+  docker rm -f "${e2e_app[$run_attempt]:-ci-e2e-app-$run_attempt}" "${e2e_redis[$run_attempt]:-ci-e2e-redis-$run_attempt}" "${e2e_db[$run_attempt]:-ci-e2e-db-$run_attempt}" 2>/dev/null || true
+  docker network rm "ci-e2e-net-$run_attempt" 2>/dev/null || true
+  docker image rm -f "ci-e2e:$run_attempt" 2>/dev/null || true
+done
+
 echo "== Docker container prune (stopped containers) =="
 docker container prune -f || true
 
