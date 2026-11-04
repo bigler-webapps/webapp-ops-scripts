@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import signal
@@ -532,3 +533,65 @@ def test_maintenance_success_and_reboot_reconciliation_require_actual_completion
     assert recovery.read_host_reservation(root) is None
     with recovery.writer_guard(None, lock_path=lock, state_root=root):
         pass
+
+
+def _migration_tx(tmp_path, monkeypatch, config_files, *, stderr=b""):
+    """A transaction wired just far enough to exercise run_migrations without flock or Docker."""
+    root, lock = make_test_state(tmp_path)
+    work = tmp_path / "app"
+    work.mkdir()
+    (work / "docker-compose.yml").write_text("services: {}\n")
+    stopped = docker_item("be1111111111", "backend", running=False)
+    tx = recovery.RecoveryTransaction(
+        "demo_staging", "demo", "run-9-1", "refresh", lock_path=lock, state_root=root,
+        runner=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, json.dumps([stopped]), ""),
+    )
+    tx.fd = 3
+    tx.record = {"migration": "running"}
+    tx.services = [{"id": "be1111111111", "service": "backend", "working_dir": str(work),
+                    "config_files": ",".join(str(work / name) for name in config_files)}]
+    seen = {}
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            seen["command"] = command
+            assert kwargs["stderr"] == subprocess.PIPE
+            self.stderr = io.BytesIO(stderr)
+
+    monkeypatch.setattr(recovery.subprocess, "Popen", Child)
+    return tx, work, seen
+
+
+def test_run_migrations_tolerates_a_missing_gate_overlay_but_not_other_missing_files(tmp_path, monkeypatch):
+    tx, work, seen = _migration_tx(tmp_path, monkeypatch,
+                                   ["docker-compose.yml", ".webapp-recovery-compose.json"])
+    tx.run_migrations()
+    assert str(work / ".webapp-recovery-compose.json") not in seen["command"]
+    assert str(work / "docker-compose.yml") in seen["command"]
+    assert tx.record["overlay_missing"] is True
+
+    for index, names in enumerate((["docker-compose.yml", "docker-compose.other.yml"],
+                                   ["docker-compose.yml", "sub/.webapp-recovery-compose.json"])):
+        (tmp_path / f"case{index}").mkdir()
+        tx, _work, _seen = _migration_tx(tmp_path / f"case{index}", monkeypatch, names)
+        with pytest.raises(recovery.RecoveryError, match="invalid"):
+            tx.run_migrations()
+        assert names[1].rsplit("/", 1)[-1] in tx.record["failure_detail"]
+
+
+def test_failed_migration_keeps_a_bounded_masked_stderr_tail_out_of_the_result(tmp_path, monkeypatch):
+    noise = b"x" * 10000
+    tail = (b"CAUSE-MARKER-Q7 connection to postgres://app:hunter2@db:5432/app failed\n"
+            b"also postgres://u:p:w@x@db/app\n"
+            b"Authorization: Bearer tok-9f8e\nSECRET_KEY=abc123")
+    tx, _work, _seen = _migration_tx(tmp_path, monkeypatch, ["docker-compose.yml"], stderr=noise + tail)
+    monkeypatch.setattr(recovery, "_write_json", lambda path, record: None)
+    tx.run_migrations()
+    tx.update_phase("migration", "failed", error_code="migration-failed")
+    detail = tx.record["failure_detail"]
+    assert len(detail) <= recovery.FAILURE_DETAIL_MAX
+    assert detail.endswith("SECRET_KEY=***") and "CAUSE-MARKER-Q7 connection to postgres://***@db:5432/app failed" in detail
+    assert "hunter2" not in detail and "p:w" not in detail and "abc123" not in detail and "tok-9f8e" not in detail and detail.startswith("x")
+    assert "failure_detail" not in json.loads(recovery.recovery_result(tx.record))["recovery_result"]
+    tx.update_phase("migration", "completed")
+    assert "failure_detail" not in tx.record

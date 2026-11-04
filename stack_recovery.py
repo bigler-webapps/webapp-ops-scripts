@@ -33,6 +33,10 @@ SCHEMA_VERSION = 1
 IDENTITY_PATH = Path("/usr/local/lib/webapp-recovery/identity.json")
 GATE_TARGET = "/run/webapp-recovery"
 GATE_MARKER = "webapp-recovery-gate-v1"
+# The deploy rsync (--delete) can remove the gate overlay when a deploy is refused before
+# guarded_deploy rewrites it; the one-shot migration does not need it (it overrides the entrypoint).
+GATE_OVERLAY_NAME = ".webapp-recovery-compose.json"
+FAILURE_DETAIL_MAX = 4096
 PHASES = ("database", "artifacts", "migration", "checks", "application")
 STATUSES = {
     "database": {"not_attempted", "importing", "completed", "failed", "unknown"},
@@ -46,6 +50,39 @@ _local = threading.local()
 
 class RecoveryError(RuntimeError):
     pass
+
+
+def bounded_failure_detail(text: str | bytes | None) -> str:
+    """Last FAILURE_DETAIL_MAX characters of a child's diagnostics, printable ASCII only.
+
+    Kept in the root-readable app record, never in recovery_result or receiver evidence.
+    Credentials in URLs and obvious secret assignments are masked on a best-effort basis.
+    """
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    text = (text or "")[-FAILURE_DETAIL_MAX:]
+    text = re.sub(r"://[^/\s]*@", "://***@", text)
+    text = re.sub(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY)[A-Z0-9_]*)\s*[=:]\s*\S+", r"\1=***", text)
+    text = re.sub(r"(?i)\b(bearer|basic)\s+\S+", r"\1 ***", text)
+    return re.sub(r"[^\x20-\x7e\n]", "?", text).strip()
+
+
+class _TailReader:
+    """Drain a child's stderr pipe in memory, keeping only the last FAILURE_DETAIL_MAX bytes."""
+
+    def __init__(self, stream):
+        self._buffer = b""
+        self._thread = threading.Thread(target=self._drain, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _drain(self, stream) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := stream.read(8192):
+                self._buffer = (self._buffer + chunk)[-FAILURE_DETAIL_MAX:]
+
+    def tail(self) -> bytes:
+        self._thread.join(timeout=5)
+        return self._buffer
 
 
 def _installed_identity() -> dict:
@@ -754,6 +791,7 @@ class RecoveryTransaction:
         self._previous_handler = None
         self._entered = False
         self.event_watcher: _ContainerStartWatcher | None = None
+        self._migration_stderr = None
 
     def _docker(self, *args: str, check: bool = True):
         if not args or args[0] not in {"ps", "inspect", "update", "stop", "start", "top"}:
@@ -977,29 +1015,55 @@ class RecoveryTransaction:
         """Run migrations in a one-shot compose container while normal backend stays stopped."""
         if self.fd is None:
             raise RecoveryError("no active destination lock")
+
+        def refuse(message: str) -> RecoveryError:
+            if self.record is not None:
+                self.record["failure_detail"] = bounded_failure_detail(message)
+            return RecoveryError(message)
+
         backend = next((service for service in self.services if service["service"] == "backend"), None)
         if not backend or not backend.get("working_dir") or not backend.get("config_files"):
-            raise RecoveryError("compose metadata for the controlled migration is unavailable")
+            raise refuse("compose metadata for the controlled migration is unavailable")
         app_ids = [service["id"] for service in self.services]
         if app_ids:
             observed = json.loads(self._docker("inspect", *app_ids).stdout)
             if any(bool((item.get("State") or {}).get("Running")) for item in observed):
-                raise RecoveryError("ordinary application services must remain stopped for migration")
+                raise refuse("ordinary application services must remain stopped for migration")
         working_dir = Path(backend["working_dir"])
         files = [Path(value) for value in backend["config_files"].split(",") if value]
+        if working_dir.is_absolute():
+            # The gate overlay only gates ordinary startup; the one-shot below overrides the entrypoint.
+            kept = [path for path in files
+                    if path.is_file() or path != working_dir / GATE_OVERLAY_NAME]
+            if self.record is not None:
+                # Reflects the file, not the migration: it stays until a later run sees the file again.
+                if len(kept) != len(files):
+                    self.record["overlay_missing"] = True
+                else:
+                    self.record.pop("overlay_missing", None)
+            files = kept
         if (not working_dir.is_absolute() or not working_dir.is_dir() or not files
                 or any(not path.is_absolute() or not path.is_file() for path in files)):
-            raise RecoveryError("compose metadata for the controlled migration is invalid")
+            missing = [path.name for path in files if not path.is_file()]
+            raise refuse("compose metadata for the controlled migration is invalid"
+                         + (f" (missing: {', '.join(missing)})" if missing else ""))
         command = [self.docker, "compose", "--project-directory", str(working_dir)]
         for compose_file in files:
             command.extend(("-f", str(compose_file)))
         command.extend(("--project-name", self.project, "run", "--rm", "--no-deps", "-T",
                         "--entrypoint", "python", "backend", "manage.py", "migrate", "--check" if check_only else "--noinput"))
-        return subprocess.Popen(
+        child = subprocess.Popen(
             command,
             pass_fds=(self.fd,), stdout=stdout if stdout is not None else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        self._migration_stderr = _TailReader(child.stderr)
+        return child
+
+    def _migration_failure_detail(self) -> str:
+        """Bounded tail of the last one-shot migration's stderr, or an empty string."""
+        reader, self._migration_stderr = self._migration_stderr, None
+        return bounded_failure_detail(reader.tail()) if reader is not None else ""
 
     def _assert_no_active_recovery_children(self) -> None:
         if not self.db_container_id:
@@ -1057,6 +1121,12 @@ class RecoveryTransaction:
             self.record["observed_application"] = status
         if error_code:
             self.record["primary_error"] = _safe_component(error_code, "error code")
+        if phase == "migration" and status == "failed":
+            detail = self._migration_failure_detail()
+            if detail:
+                self.record["failure_detail"] = detail
+        elif phase == "migration" and status == "completed":
+            self.record.pop("failure_detail", None)
         self.record["updated_at"] = int(time.time())
         _write_json(self.path, self.record)
 
@@ -1256,6 +1326,7 @@ class RecoveryTransaction:
             with contextlib.suppress(Exception):
                 self.event_watcher.close()
             self.event_watcher = None
+        self._migration_stderr = None
         if getattr(_local, "transaction", None) is self:
             del _local.transaction
         self._release()
