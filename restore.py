@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import argparse
+import re
 import subprocess
 import shutil
 import signal
@@ -31,6 +32,34 @@ ENV_ALIASES = {
 
 def log(msg: str) -> None:
     print(f"[RESTORE] {msg}")
+
+
+# The drill imports into staging in parallel and every import queues on the host-wide
+# recovery lock for about half a minute each, so the later ones wait for minutes.
+# stack_recovery's own 300 s default stays for every other caller and target.
+STAGING_LOCK_TIMEOUT_SECONDS = 45 * 60.0
+# Must equal the text stack_recovery raises when its lock wait runs out.
+LOCK_TIMEOUT_MESSAGE = "timed out waiting for destination recovery lock"
+STAGING_ENV_NAMES = ("staging", "stage")
+
+
+def import_lock_options(target_env) -> dict:
+    """Extra RecoveryTransaction options for an import into target_env (empty keeps the default wait)."""
+    if target_env in STAGING_ENV_NAMES:
+        return {"lock_timeout": STAGING_LOCK_TIMEOUT_SECONDS}
+    return {}
+
+
+def failure_label(exc: BaseException) -> str:
+    """What the import failure log line names: the class, plus the fixed recovery message for RecoveryError."""
+    name = type(exc).__name__
+    if not isinstance(exc, stack_recovery.RecoveryError):
+        return name
+    if str(exc) == LOCK_TIMEOUT_MESSAGE:
+        return f"{name}: recovery_lock_timeout"
+    # Printable ASCII only: a few messages carry a name (file, project) and must not smuggle control sequences.
+    message = re.sub(r"[^\x20-\x7e]", "?", " ".join(str(exc).split()))[:200]
+    return f"{name}: {message}" if message else name
 
 
 def run_cmd(cmd, env=None, check=True):
@@ -502,7 +531,7 @@ def mode_in_place(args):
             tx.complete(artifacts="not_applicable", migration="completed", checks="completed")
             log(stack_recovery.recovery_result(tx.record))
     except Exception as e:
-        log(f"ERROR: Import failed ({type(e).__name__}).")
+        log(f"ERROR: Import failed ({failure_label(e)}).")
         if getattr(tx_context, "record", None) is not None:
             log(stack_recovery.recovery_result(tx_context.record))
         sys.exit(1)
@@ -637,6 +666,7 @@ def mode_import_only(args):
         restart_left_stopped=bool(getattr(args, "restart_left_stopped", False)),
         origin_run_id=getattr(args, "origin_run_id", None),
         origin_attempt=getattr(args, "origin_attempt", None),
+        **import_lock_options(args.target_env),
     )
     try:
         with tx_context as tx:
@@ -649,7 +679,7 @@ def mode_import_only(args):
             tx.complete(artifacts="not_applicable", migration="completed", checks="completed")
             log(stack_recovery.recovery_result(tx.record))
     except Exception as e:
-        log(f"ERROR: Import failed ({type(e).__name__}).")
+        log(f"ERROR: Import failed ({failure_label(e)}).")
         if getattr(tx_context, "record", None) is not None:
             log(stack_recovery.recovery_result(tx_context.record))
         sys.exit(1)

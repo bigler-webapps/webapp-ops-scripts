@@ -419,3 +419,90 @@ def test_missing_host_contract_refuses_before_database_reset(tmp_path, monkeypat
     with pytest.raises(SystemExit):
         restore.mode_import_only(SimpleNamespace(app="example", target_env="staging", dump_file=str(dump)))
     assert events == []
+
+
+def test_wm_inf_112_staging_import_waits_45_minutes_for_the_recovery_lock(restore_flow):
+    events, instances, active, args = restore_flow
+    assert restore.mode_import_only(args) == 0
+    assert instances[0].options["lock_timeout"] == 2700.0
+
+
+@pytest.mark.parametrize("target_env", ["production", "prod"])
+def test_wm_inf_112_other_import_targets_keep_the_default_lock_wait(restore_flow, target_env):
+    events, instances, active, args = restore_flow
+    args.target_env = target_env
+    assert restore.mode_import_only(args) == 0
+    assert "lock_timeout" not in instances[0].options
+
+
+def test_wm_inf_112_same_host_restore_keeps_the_default_lock_wait(restore_flow, monkeypatch):
+    events, instances, active, args = restore_flow
+    monkeypatch.setenv("RESTIC_REPOSITORY", "synthetic-repository")
+    monkeypatch.setenv("RESTIC_PASSWORD", "synthetic-test-value")
+    monkeypatch.setattr(restore, "resolve_snapshot", lambda *a: ("snapshot", "2026-10-27T00:00:00Z"))
+    monkeypatch.setattr(restore, "list_sql_gz", lambda *a: ["selected.sql.gz"])
+    monkeypatch.setattr(restore, "choose_dump_for_db", lambda *a: "selected.sql.gz")
+    args.snapshot = "latest"
+    assert restore.mode_in_place(args) == 0
+    assert "lock_timeout" not in instances[0].options
+
+
+def _failing_enter(message):
+    class Refused:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            raise restore.stack_recovery.RecoveryError(message)
+
+        def __exit__(self, *a):
+            pass
+    return Refused
+
+
+@pytest.fixture
+def import_args(tmp_path, monkeypatch):
+    dump = tmp_path / "dump.sql.gz"
+    dump.write_bytes(b"synthetic")
+    monkeypatch.setattr(restore, "find_db_container_id", lambda projects: ("db-id", "example_staging"))
+    monkeypatch.setattr(restore, "get_db_credentials", lambda cid: ("user", "db"))
+    return SimpleNamespace(app="example", target_env="staging", dump_file=str(dump))
+
+
+def test_wm_inf_112_lock_timeout_is_named_in_the_import_failure_line(import_args, monkeypatch, capsys):
+    monkeypatch.setattr(restore.stack_recovery, "RecoveryTransaction", _failing_enter(restore.LOCK_TIMEOUT_MESSAGE))
+    with pytest.raises(SystemExit) as failure:
+        restore.mode_import_only(import_args)
+    assert failure.value.code == 1
+    assert "[RESTORE] ERROR: Import failed (RecoveryError: recovery_lock_timeout)." in capsys.readouterr().out
+
+
+def test_wm_inf_112_other_recovery_error_logs_its_fixed_message(import_args, monkeypatch, capsys):
+    monkeypatch.setattr(restore.stack_recovery, "RecoveryTransaction",
+                        _failing_enter("no labelled containers found for recovery project"))
+    with pytest.raises(SystemExit):
+        restore.mode_import_only(import_args)
+    out = capsys.readouterr().out
+    assert "Import failed (RecoveryError: no labelled containers found for recovery project)." in out
+    assert "recovery_lock_timeout" not in out
+
+
+def test_wm_inf_112_failure_label_is_single_line_bounded_and_class_only_for_other_errors():
+    error = restore.stack_recovery.RecoveryError
+    assert restore.failure_label(RuntimeError("secret detail")) == "RuntimeError"
+    assert restore.failure_label(error("")) == "RecoveryError"
+    label = restore.failure_label(error("first line\nsecond   line " + "x" * 400))
+    assert "\n" not in label and "first line second line" in label
+    assert len(label) <= len("RecoveryError: ") + 200
+    hostile = restore.failure_label(error("unsafe file: \x1b[31mred\x1b[0m‮ name"))
+    assert all(" " <= ch <= "~" for ch in hostile) and "\x1b" not in hostile
+
+
+def test_wm_inf_112_stack_recovery_defaults_and_message_are_unchanged():
+    """The named code depends on stack_recovery's exact message; the other callers rely on its 300 s default."""
+    import inspect
+    source = inspect.getsource(restore.stack_recovery)
+    assert f'RecoveryError("{restore.LOCK_TIMEOUT_MESSAGE}")' in source
+    for target in (restore.stack_recovery.RecoveryTransaction.__init__, restore.stack_recovery.writer_guard,
+                   restore.stack_recovery._raw_host_lock):
+        assert inspect.signature(target).parameters["lock_timeout"].default == 300.0
