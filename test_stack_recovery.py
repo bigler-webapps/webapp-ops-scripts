@@ -595,3 +595,81 @@ def test_failed_migration_keeps_a_bounded_masked_stderr_tail_out_of_the_result(t
     assert "failure_detail" not in json.loads(recovery.recovery_result(tx.record))["recovery_result"]
     tx.update_phase("migration", "completed")
     assert "failure_detail" not in tx.record
+
+
+def _prebuilt_item(cid, service, root, project, *, gated, policy="unless-stopped", private_config=""):
+    """A container as the prebuilt SDK deploys it: private compose configuration, and (when gated) the gate entrypoint and mount."""
+    item = docker_item(cid, service, True, policy)
+    item["Config"]["Labels"].update({
+        "com.docker.compose.project.working_dir": "/srv/apps/demo_stage",
+        "com.docker.compose.project.config_files": private_config,
+    })
+    item["Config"]["Entrypoint"] = (["/bin/sh", "-c", "script", recovery.GATE_MARKER] if gated else None)
+    item["Mounts"] = ([{"Source": str(root / "gates" / project), "Destination": recovery.GATE_TARGET, "RW": False}]
+                      if gated else [])
+    return item
+
+
+class _PrebuiltDocker(FakeDocker):
+    def __init__(self, root, project, *, ungated_service=None, private_config=""):
+        super().__init__()
+        self.items = {
+            "db1111111111": docker_item("db1111111111", "db"),
+            "be1111111111": _prebuilt_item("be1111111111", "backend", root, project, private_config=private_config,
+                                           gated=ungated_service != "backend"),
+            "re1111111111": _prebuilt_item("re1111111111", "redis", root, project, private_config=private_config,
+                                           gated=ungated_service != "redis"),
+        }
+
+    def __call__(self, cmd, **kwargs):
+        tail = cmd[1:]
+        if tail[:4] == ["ps", "-a", "-q", "-f"] and "label=com.docker.compose.oneoff=True" not in tail:
+            self.calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "db1111111111\nbe1111111111\nre1111111111\n", "")
+        return super().__call__(cmd, **kwargs)
+
+
+@pytest.mark.skipif(recovery.fcntl is None, reason="Linux flock is required")
+def test_a_prebuilt_deployed_project_with_gated_services_and_its_private_configuration_is_accepted(tmp_path):
+    root, lock = make_test_state(tmp_path)
+    project = "demo_staging"
+    private = tmp_path / "prebuilt" / "prebuilt-target-config-demo_staging-abc12345"
+    private.mkdir(parents=True)
+    (private / "compose.json").write_text("{}", encoding="utf-8")
+    docker = _PrebuiltDocker(root, project, private_config=str(private / "compose.json"))
+    tx = recovery.RecoveryTransaction(
+        project, "demo", "run-7-1", "refresh", lock_path=lock, state_root=root, runner=docker,
+        require_startup_gate=True,  # production default: state root is the real one
+    )
+    with tx as active:
+        assert {service["service"]: service["startup_gated"] for service in active.services} == {"backend": True, "redis": True}
+        assert active.services[0]["config_files"] == str(private / "compose.json")
+    assert recovery.read_status(project, root)["status"] == "recovery-required"
+
+
+@pytest.mark.skipif(recovery.fcntl is None, reason="Linux flock is required")
+@pytest.mark.parametrize("ungated", ["backend", "redis"])
+def test_one_ungated_restarting_service_is_still_refused_before_any_state_write(tmp_path, ungated):
+    root, lock = make_test_state(tmp_path)
+    project = "demo_staging"
+    docker = _PrebuiltDocker(root, project, ungated_service=ungated, private_config="/x/compose.json")
+    tx = recovery.RecoveryTransaction(
+        project, "demo", "run-8-1", "refresh", lock_path=lock, state_root=root, runner=docker, require_startup_gate=True,
+    )
+    with pytest.raises(recovery.RecoveryError, match="startup gate has not been adopted"):
+        with tx:
+            pytest.fail("the transaction must not be entered")
+    assert recovery.read_status(project, root) is None
+    assert not (root / "gates" / project).exists()
+    assert not any(call[1:2] in (["update"], ["stop"]) for call in docker.calls)
+
+
+def test_run_migrations_accepts_a_configuration_file_outside_the_application_directory(tmp_path, monkeypatch):
+    tx, work, seen = _migration_tx(tmp_path, monkeypatch, ["docker-compose.yml"])
+    private = tmp_path / "private" / "compose.json"
+    private.parent.mkdir()
+    private.write_text("{}", encoding="utf-8")
+    tx.services[0]["config_files"] = str(private)
+    tx.run_migrations()
+    assert seen["command"][seen["command"].index("-f") + 1] == str(private)
+    assert "overlay_missing" not in tx.record
