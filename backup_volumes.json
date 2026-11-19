@@ -8,6 +8,7 @@
     "innoservice_prod_media_volume"
   ],
   "exclude": [
+    "photogallery_*",
     "*pipeline_artifacts*",
     "*calibration_outputs*",
     "*cache*",

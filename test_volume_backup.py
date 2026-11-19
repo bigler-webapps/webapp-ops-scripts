@@ -18,13 +18,13 @@ import volume_selection as vs  # noqa: E402
 CFG = vs.load_config()
 
 ALL_NAMES = [
-    "photogallery_production_media_volume",
     "kira_production_media_volume",
     "cockpit_production_open_webui_data",
     "hram_production_excel_volume",
     "hram_production_assistant_cli_sessions",
     "innoservice_prod_media_volume",
     # must NOT be selected
+    "photogallery_production_media_volume",  # operator 2026-11-19: Photogallery is not backed up here
     "hram_production_pipeline_artifacts",
     "hram_production_calibration_outputs",
     "photogallery_production_postgres_data",
@@ -36,7 +36,7 @@ ALL_NAMES = [
     "unmounted_production_media_volume",
 ]
 MOUNTED = set(ALL_NAMES) - {"unmounted_production_media_volume"}
-EXPECTED = sorted(ALL_NAMES[:6])
+EXPECTED = sorted(ALL_NAMES[:5])
 
 
 def test_selection_keeps_only_declared_mounted_production_user_data():
