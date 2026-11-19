@@ -1,6 +1,6 @@
 # Work-Order Register - Work orders - webapp-ops-scripts
 
-Repo token: `OPS`. Stream `REC`: targeted data-recovery tooling.
+Repo token: `OPS`. Stream `REC`: targeted data-recovery tooling. Stream `BAK`: nightly backup coverage and restore drills.
 Historical `WM-OPS-*` files retain their existing IDs; their index is in webapp-management.
 
 The register is `work-orders/register.jsonl` (one JSON object per work order); read and write it only
