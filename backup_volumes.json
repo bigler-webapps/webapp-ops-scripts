@@ -5,7 +5,8 @@
     "*_production_excel_volume",
     "*_production_assistant_cli_sessions",
     "cockpit_production_open_webui_data",
-    "innoservice_prod_media_volume"
+    "innoservice_prod_media_volume",
+    "jg-webapp_media_volume"
   ],
   "exclude": [
     "photogallery_*",

@@ -23,6 +23,7 @@ ALL_NAMES = [
     "hram_production_excel_volume",
     "hram_production_assistant_cli_sessions",
     "innoservice_prod_media_volume",
+    "jg-webapp_media_volume",  # jg-ferien production media, legacy name (mounted by jg_production-backend-1)
     # must NOT be selected
     "photogallery_production_media_volume",  # operator 2026-11-19: Photogallery is not backed up here
     "hram_production_pipeline_artifacts",
@@ -36,7 +37,7 @@ ALL_NAMES = [
     "unmounted_production_media_volume",
 ]
 MOUNTED = set(ALL_NAMES) - {"unmounted_production_media_volume"}
-EXPECTED = sorted(ALL_NAMES[:5])
+EXPECTED = sorted(ALL_NAMES[:6])
 
 
 def test_selection_keeps_only_declared_mounted_production_user_data():
