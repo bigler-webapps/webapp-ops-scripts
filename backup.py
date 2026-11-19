@@ -20,6 +20,9 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import volume_selection as vs  # noqa: E402
+
 # --- Environment / Config ---
 RESTIC_REPO_LOCAL = os.environ.get("RESTIC_REPO_LOCAL")
 RESTIC_REPO_B2 = os.environ.get("RESTIC_REPO_B2")
@@ -34,6 +37,8 @@ INFRA_PATHS_FILE = Path(os.environ.get("INFRA_PATHS_FILE", str(SCRIPTS_DIR / "in
 DUMP_DIR = Path("/srv/backups/db-dumps")
 PATHS_FILE = Path("/tmp/restic_backup_paths.txt")
 GENERATE_PATHS_SCRIPT = SCRIPTS_DIR / "generate_paths.py"
+VOLUMES_REPORT_FILE = Path("/srv/backups/.volumes_report.json")  # deploy-owned dir, not /tmp
+VOLUME_REPORT: Optional[List[dict]] = None
 
 # Hand-off for verify_backup.py (runs as a separate SSH session right after this
 # script): the B2 snapshot this run just created, so verification checks THIS
@@ -123,15 +128,48 @@ def ensure_restic_available() -> None:
     )
 
 
+def check_volume_size_gate(report: List[dict]) -> None:
+    """Stop before any dump or upload when the selected volumes exceed the host's size limit."""
+    limit = vs.load_config()["max_total_bytes_per_host"]
+    total = vs.total_bytes(report)
+    if total > limit:
+        fail(
+            f"Selected volume data {vs.format_bytes(total)} exceeds the size gate "
+            f"{vs.format_bytes(limit)} for this host; stop and report before backing up. "
+            f"Volumes: {', '.join(v['name'] for v in report)}"
+        )
+
+
+def report_volume_gaps(stderr: str) -> None:
+    """Name the selected volumes restic could not read or find (capability lost, volume removed)."""
+    named = vs.volumes_named_in(stderr, VOLUME_REPORT)
+    for name in named:
+        log(f"VOLUME GAP: {name} could not be backed up (unreadable or missing)")
+    if VOLUME_REPORT and not named:
+        log("WARN: restic failed; no selected volume path is named in its error output")
+
+
 def generate_paths_file() -> None:
     if not GENERATE_PATHS_SCRIPT.exists():
         fail(f"Missing paths generator: {GENERATE_PATHS_SCRIPT}")
 
+    VOLUMES_REPORT_FILE.unlink(missing_ok=True)
     ok, out, err = run_cmd(
-        ["python3", str(GENERATE_PATHS_SCRIPT), "--infra-paths-file", str(INFRA_PATHS_FILE)]
+        [
+            "python3", str(GENERATE_PATHS_SCRIPT),
+            "--infra-paths-file", str(INFRA_PATHS_FILE),
+            "--volumes-report", str(VOLUMES_REPORT_FILE),
+        ]
     )
     if not ok:
         fail("generate_paths.py failed")
+
+    global VOLUME_REPORT
+    VOLUME_REPORT = vs.load_report(VOLUMES_REPORT_FILE)
+    if VOLUME_REPORT is None:
+        fail("generate_paths.py wrote no volume report")
+    check_volume_size_gate(VOLUME_REPORT)
+    log(f"Volumes selected: {len(VOLUME_REPORT)} paths, {vs.format_bytes(vs.total_bytes(VOLUME_REPORT))}")
 
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     with open(PATHS_FILE, "w", encoding="utf-8") as f:
@@ -333,8 +371,9 @@ def run_restic(repo_url: Optional[str], repo_name: str, *, unlock_stale: bool = 
         str(DUMP_DIR),
     ]
 
-    ok_b, out_b, _ = run_cmd(backup_cmd, env=env)
+    ok_b, out_b, err_b = run_cmd(backup_cmd, env=env)
     if not ok_b:
+        report_volume_gaps(err_b + (out_b or ""))
         return False, None
 
     snap_id = None
@@ -434,7 +473,15 @@ def main() -> None:
     if not ok_local or not ok_b2:
         fail("Restic backup failed for one or more repositories.")
 
-    log(f"SUMMARY: dumps ok, local={snap_local or 'n/a'}, b2={snap_b2 or 'n/a'}")
+    log(
+        f"VOLUMES_BACKED_UP={len(VOLUME_REPORT or [])} "
+        f"bytes={vs.total_bytes(VOLUME_REPORT or [])}"
+    )
+    log(
+        f"SUMMARY: dumps ok, volumes={len(VOLUME_REPORT or [])} paths/"
+        f"{vs.format_bytes(vs.total_bytes(VOLUME_REPORT or []))}, "
+        f"local={snap_local or 'n/a'}, b2={snap_b2 or 'n/a'}"
+    )
     log("== Backup Success ==")
 
 

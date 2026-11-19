@@ -1,0 +1,20 @@
+{
+  "_comment": "OPS-BAK-1: production user-data Docker volumes that the nightly restic backup includes. A volume is backed up only if it matches an include pattern, matches no exclude pattern, and a RUNNING container mounts it. Databases are dumped separately (pg_dump). Secrets volumes are never listed here (secrets come from Proton via sync-secrets). max_total_bytes_per_host stops a host's run before any upload when its selected volumes exceed it (OPS-BAK-1 size gate: basis 13.6 GB + 25 percent).",
+  "include": [
+    "*_production_media_volume",
+    "*_production_excel_volume",
+    "*_production_assistant_cli_sessions",
+    "cockpit_production_open_webui_data",
+    "innoservice_prod_media_volume"
+  ],
+  "exclude": [
+    "*pipeline_artifacts*",
+    "*calibration_outputs*",
+    "*cache*",
+    "*model*",
+    "*secret*",
+    "*stage*",
+    "*staging*"
+  ],
+  "max_total_bytes_per_host": 17000000000
+}

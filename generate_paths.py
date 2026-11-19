@@ -6,7 +6,8 @@ import json
 import sys
 from pathlib import Path
 
-IGNORE_KEYWORDS = ["postgres", "postgres_data", "db_data", "pgdata", "redis", "redis_data", "mariadb", "mariadb_data", "mysql"]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import volume_selection as vs  # noqa: E402
 
 ALLOW_VOLUME_FAILURE = os.environ.get("ALLOW_VOLUME_FAILURE") == "1"
 
@@ -43,34 +44,16 @@ def emit_existing(path: str, seen: set) -> None:
         sys.stderr.write(f"Skipping missing path: {path}\n")
 
 
-def list_volume_names(prefix: list) -> list:
-    cmd = prefix + ["volume", "ls", "--format", "{{.Name}}"]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return [v.strip() for v in res.stdout.splitlines() if v.strip()]
-
-
-def inspect_mountpoints(prefix: list, volumes: list) -> list:
-    """Inspect Docker volumes and return mountpoints, filtered by name."""
-    mountpoints = []
-    if not volumes:
-        return mountpoints
-
+def inspect_mountpoints(prefix: list, volumes: list) -> dict:
+    """Return {volume name: mountpoint} from the Docker daemon (no file access)."""
+    mountpoints = {}
     chunk_size = 200
     for i in range(0, len(volumes), chunk_size):
-        chunk = volumes[i:i + chunk_size]
-        cmd = prefix + ["volume", "inspect"] + chunk
+        cmd = prefix + ["volume", "inspect"] + volumes[i:i + chunk_size]
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-
-        for vol in data:
-            name = (vol.get("Name") or "").lower()
-            mountpoint = vol.get("Mountpoint") or ""
-            if not mountpoint:
-                continue
-            if any(k in name for k in IGNORE_KEYWORDS):
-                continue
-            mountpoints.append(mountpoint)
-
+        for vol in json.loads(res.stdout):
+            if vol.get("Name") and vol.get("Mountpoint"):
+                mountpoints[vol["Name"]] = vol["Mountpoint"]
     return mountpoints
 
 
@@ -80,6 +63,11 @@ def main() -> int:
         "--infra-paths-file",
         default=os.environ.get("INFRA_PATHS_FILE", ""),
         help="File with static infra paths to back up (one per line, # = comment).",
+    )
+    parser.add_argument(
+        "--volumes-report",
+        default="",
+        help="Write the selected volumes (name, path, bytes) as JSON to this file.",
     )
     args = parser.parse_args()
 
@@ -96,17 +84,27 @@ def main() -> int:
         else:
             sys.stderr.write(f"Infra paths file not found: {args.infra_paths_file}\n")
 
-    prefix = docker_cmd_prefix()
-
+    report = []
     try:
-        volumes = list_volume_names(prefix)
-        mountpoints = inspect_mountpoints(prefix, volumes)
-        for mp in sorted(mountpoints):
-            emit_existing(mp, seen)
-        return 0
-    except subprocess.CalledProcessError as e:
-        sys.stderr.write(e.stderr or f"Docker command failed: {e}\n")
-        return 0 if ALLOW_VOLUME_FAILURE else 1
+        cfg = vs.load_config()
+        prefix = docker_cmd_prefix()
+        mounted = vs.running_container_volumes(prefix)
+        selected = vs.select_volumes(mounted, cfg)
+        report = vs.build_report(selected, inspect_mountpoints(prefix, selected), vs.volume_sizes(prefix))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError) as e:
+        sys.stderr.write(f"Volume selection failed: {getattr(e, 'stderr', None) or e}\n")
+        # No override: a failed selection must never become a green run without volume data.
+        return 1
+
+    # Volume paths are NOT stat()ed: `deploy` cannot read them; restic's capability does.
+    for v in report:
+        if v["path"] not in seen:
+            seen.add(v["path"])
+            print(v["path"])
+
+    if args.volumes_report:
+        Path(args.volumes_report).write_text(json.dumps(report), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":

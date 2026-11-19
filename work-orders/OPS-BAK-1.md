@@ -74,11 +74,23 @@ The B2 buckets `mhaas-backup` and `innoservice-backup` show the lifecycle "Keep 
 
 # B. Implementation map — addressed to the implementer
 
-To be filled by the Orchestrator.
+Infra lane: implemented by the Orchestrator (no dispatched implementer). Seams: `backup_volumes.json` (declared selection), `volume_selection.py`, `generate_paths.py`, `backup.py` (`check_volume_size_gate`, `report_volume_gaps`, summary), `test_volume_backup.py` here; `ansible/roles/srv_dirs` and `ansible/tests/test_ops_bak_1_restic_capability.py` in webapp-management.
 
 # C. Orchestrator only — NOT ADDRESSED TO THE IMPLEMENTER
 
-To be filled by the Orchestrator.
+Review round 1 and closing round 2: codex/gpt-6.1-terra (envelope, regression, tests, sec_review) and codex/gpt-6-luna (duplication) on the webapp-ops-scripts diff; Ansible diff by a separate Claude sec_reviewer (sonnet) in both rounds.
+
+## Completion
+
+Status 2026-11-19: code landed, WO stays in-review. Not done (need prod/B2 access, which agents lack): restore drill (decision 5), real size measurement and B2 bucket sizes before/after (scope 7), Ansible apply on the prod hosts.
+
+- Prerequisite met: operator 2026-11-19 "Lifecycle ist auf 30 Tage umgestellt" - `mhaas-backup` and `innoservice-backup` keep prior versions for 30 days.
+- Built: declared selection in `backup_volumes.json` (include patterns for media/excel/assistant-session/open_webui volumes, excludes for pipeline_artifacts, calibration_outputs, caches, models, secrets, staging; only volumes a RUNNING container mounts). `generate_paths.py` emits volume paths without stat and writes a report (name, path, bytes; sizes from `docker system df -v`). `backup.py`: size gate before dumps/uploads, `VOLUME GAP: <name>` on a restic failure naming a selected path, `VOLUMES_BACKED_UP=<n> bytes=<b>` and summary line. Ansible `srv_dirs`: `cap_dac_read_search+ep` on `/usr/bin/restic` only, prod hosts only, exact-match guard, regular-file assert, post-set verify.
+- Applied include list: the patterns above on every host that runs backup.py; no per-host list. An earlier `enabled_hosts` gate was removed after review (it backed up nothing until enabled, and a hostname mismatch would be a silent gap).
+- Deviation: the size gate is per host (17 GB, basis 13.6 GB + 25 %); a host cannot see the others, so the combined-across-hosts check remains the operator's measurement before the first run. `ALLOW_VOLUME_FAILURE` no longer hides a failed volume selection.
+- First-run caveats (unverified): the `docker system df -v --format json` Size parsing and restic's error text naming the path were not run against a real host; a parse failure turns the run red, never green. The first run uploads about 13.6 GB (mostly Photogallery on mhaas-prod).
+- Review: 6 raised in total after dedup, accepted and fixed: enabled_hosts gate, report in /tmp, ALLOW_VOLUME_FAILURE, volumes dropped when Docker cannot resolve them, Ansible guard/check-mode/symlink/verify, test weaknesses. Rejected: combined-size gate at runtime (not possible), non-production-container check (names carry production), stopped containers (Envelope says running only), dedicated restic copy (operator decision 1). Carried nits: Ansible assert skipped in check mode.
+- Findings for the register: stale volumes not touched (non-goal); `restore.yml` not repaired.
 
 ## Gate record
 
