@@ -12,8 +12,11 @@ from unittest import mock
 
 import recover_missing_media as recovery
 
-# The sandbox's default Windows temp location is outside writable roots.
-tempfile.tempdir = str(Path(__file__).resolve().parent)
+# The sandbox's default Windows temp location is outside writable roots. Only there: under Linux/WSL the repo
+# may sit on a 9p mount (/mnt/c), where the directory-swap tests cannot work (file creation through the dir fd of a
+# renamed directory fails), so the default temp dir (/tmp) must stay in effect.
+if os.name == "nt":
+    tempfile.tempdir = str(Path(__file__).resolve().parent)
 
 
 def execute_remote_helper(code, argv, stdin, *, docker_mount=None):
