@@ -46,10 +46,33 @@ STATUSES = {
     "application": {"expected", "stopped", "running", "healthy", "unhealthy", "unknown", "failed"},
 }
 _local = threading.local()
+# WM-INF-129: the cutover journal kept in the recovery record. `state` is "running" from the first change of the active data until
+# the new state is verified, "rolling_back"/"rollback_failed" while the last verified state is restored. An unresolved state is rolled
+# back before anything else happens to the application.
+CUTOVER_UNRESOLVED = frozenset({"running", "rolling_back", "rollback_failed", "restored"})
+CUTOVER_FIELDS = frozenset({
+    "state", "started_at", "database_previous", "database_had_live", "database_swap",
+    "database_previous_dropped", "artifacts_journal", "failed_phase",
+})
+# Public-root verification needs the app's own Traefik router rule on the staging host; it is required for these apps only.
+PUBLIC_ROOT_CHECK_APPS = frozenset({"hram"})
+TRAEFIK_RULE_LABEL_RE = re.compile(r"^traefik\.http\.routers\.[A-Za-z0-9_-]{1,63}\.rule$")
+TRAEFIK_HOST_RE = re.compile(r"Host\(`([A-Za-z0-9][A-Za-z0-9.-]{0,252})`\)")
 
 
 class RecoveryError(RuntimeError):
     pass
+
+
+def public_root_hosts(inspected: list[dict]) -> list[str]:
+    """Host names of the app's own Traefik routers, read from the labels of its containers. Never from the sender."""
+    hosts: set[str] = set()
+    for item in inspected:
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        for key, value in labels.items():
+            if isinstance(value, str) and TRAEFIK_RULE_LABEL_RE.fullmatch(key):
+                hosts.update(TRAEFIK_HOST_RE.findall(value))
+    return sorted(hosts)
 
 
 def bounded_failure_detail(text: str | bytes | None) -> str:
@@ -788,6 +811,8 @@ class RecoveryTransaction:
         self._nested = False
         self.reconcile_only = False
         self.already_completed = False
+        self.pending_rollback = False
+        self.leftover_cutover: dict[str, Any] | None = None
         self._previous_handler = None
         self._entered = False
         self.event_watcher: _ContainerStartWatcher | None = None
@@ -882,7 +907,10 @@ class RecoveryTransaction:
                     record_repair(repair_id, self.project, self.app, self.source, gate["origin_run_id"],
                                   self.state_root, attempt=gate["origin_attempt"])
                 old = None
-            if old and old.get("status") == "completed" and old.get("operation_id") == self.operation_id:
+            # A refresh that failed and was rolled back is recorded as completed (the application is back on its last verified state and
+            # ordinary writers are admitted) but it never satisfies a retry of the same operation: the retry must run its own cutover.
+            if (old and old.get("status") == "completed" and old.get("operation_id") == self.operation_id
+                    and old.get("refresh") != "failed"):
                 if old.get("source") != self.source or old.get("app") != self.app:
                     raise RecoveryError("completed operation identity does not match this application/source")
                 self.record = old
@@ -914,7 +942,16 @@ class RecoveryTransaction:
                 raise RecoveryError("application startup gate has not been adopted; recovery refused")
             if superseding:
                 self._assert_no_active_recovery_children()
-            if old and (self.reconcile_only or superseding):
+            carried_cutover = old.get("cutover") if old and old.get("status") != "completed" else None
+            previous_cutover = old.get("cutover") if old and old.get("status") == "completed" else None
+            # A verified cutover whose cleanup was interrupted: the receiver discards the leftover copies of the old state.
+            self.leftover_cutover = (dict(previous_cutover) if isinstance(previous_cutover, dict)
+                                     and previous_cutover.get("state") == "verified"
+                                     and previous_cutover.get("database_previous")
+                                     and not previous_cutover.get("database_previous_dropped") else None)
+            self.pending_rollback = bool(isinstance(carried_cutover, dict)
+                                         and carried_cutover.get("state") in CUTOVER_UNRESOLVED)
+            if old and (self.reconcile_only or superseding or self.pending_rollback):
                 previous = {item.get("service"): item for item in old.get("services", [])}
                 current = {item.get("service"): item for item in self.services}
                 if set(previous) != set(current):
@@ -948,6 +985,7 @@ class RecoveryTransaction:
                 "repair_ids": sorted(set((old.get("repair_ids", []) if old and old.get("status") != "completed" else []) + self.request_repair_ids)),
                 "supersedes_operation_id": old.get("operation_id") if superseding else None,
                 "services": self.services,
+                "cutover": dict(carried_cutover) if self.pending_rollback else {},
             }
             if len(self.record["repair_ids"]) > 100:
                 raise RecoveryError("too many repair IDs in one recovery record")
@@ -1145,28 +1183,124 @@ class RecoveryTransaction:
         self.update_phase("database", "failed", error_code="interrupted-reconciled")
         self.reconcile_only = False
 
+    def update_cutover(self, **fields: Any) -> None:
+        """Persist bounded cutover journal fields in the recovery record (durable before the change they describe)."""
+        if self.record is None:
+            raise RecoveryError("no active recovery record")
+        if set(fields) - CUTOVER_FIELDS:
+            raise RecoveryError("unsupported cutover field")
+        for value in fields.values():
+            if value is not None and not isinstance(value, (bool, int, str)) or isinstance(value, str) and len(value) > 256:
+                raise RecoveryError("invalid cutover field value")
+        cutover = self.record.setdefault("cutover", {})
+        cutover.update(fields)
+        self.record["updated_at"] = int(time.time())
+        _write_json(self.path, self.record)
+
+    def begin_cutover(self) -> None:
+        """The first change of the active data follows: from here an interruption is rolled back, never continued."""
+        self.update_cutover(state="running", started_at=int(time.time()))
+
+    def rollback_cutover(self, undo, *, failed_phase: str = "unknown", check_backend_http: bool = True,
+                         check_public_root: bool = False) -> dict[str, Any]:
+        """Restore the last verified state and finish the transaction as a failed refresh with its availability restored.
+
+        `undo` must be idempotent: it is repeated after an interruption. If it raises, the cutover stays `rollback_failed`, the startup
+        gate stays blocked and the next entry repeats it.
+        """
+        if self.record is None:
+            raise RecoveryError("no active recovery record")
+        self.update_cutover(state="rolling_back", failed_phase=_safe_component(failed_phase, "failed phase"))
+        try:
+            self._quiesce_application()
+            undo()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self.update_cutover(state="rollback_failed")
+            raise
+        # The data is back, the application is not yet verified on it: still unresolved, so an interruption or a failing verification
+        # is picked up (and repeated) by the next entry. `complete(after_rollback=True)` records `rolled_back` with its final write.
+        self.update_cutover(state="restored")
+        # The staging data is still older than production: the failed refresh stays a pending repair until a later refresh succeeds.
+        self._record_failed_repair()
+        return self.complete(after_rollback=True, check_backend_http=check_backend_http,
+                             check_public_root=check_public_root)
+
+    def _quiesce_application(self) -> None:
+        """Re-establish the barrier after a failed cutover: no service runs, none restarts on its own, the gate is blocked, and the start
+        observations of the recovery window are taken afresh so the restoring `complete` is judged on the restore only."""
+        ids = [service["id"] for service in self.services]
+        if not ids:
+            return
+        _write_startup_gate(self.project, "blocked", self.record, self.state_root)
+        for service in self.services:
+            if service["restart_policy"] != "no":
+                self._docker("update", "--restart=no", service["id"])
+        self._docker("stop", *ids)
+        states = json.loads(self._docker("inspect", *ids).stdout)
+        if any(bool((item.get("State") or {}).get("Running")) for item in states):
+            raise RecoveryError("application could not be stopped for the rollback")
+        for service, item in zip(self.services, states):
+            service["started_at"] = (item.get("State") or {}).get("StartedAt")
+        if self.event_watcher is not None:
+            with contextlib.suppress(Exception):
+                self.event_watcher.close()
+            self.event_watcher = _ContainerStartWatcher(self.docker, self.project) if self.runner is subprocess.run else None
+
+    def _verify_public_root(self, states: list[dict[str, Any]]) -> None:
+        hosts = public_root_hosts(states)
+        if not hosts:
+            raise RecoveryError("public root host of the application is unknown")
+        deadline = time.monotonic() + 120
+        for host in hosts:
+            while True:
+                command = ["curl", "--max-time", "10", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                           "--resolve", f"{host}:443:127.0.0.1", "-k", f"https://{host}/"]
+                options = {"capture_output": True, "text": True, "check": False}
+                if self.runner is subprocess.run:
+                    options.update(pass_fds=(self.fd,), timeout=15)
+                response = self.runner(command, **options)
+                code = (response.stdout or "").strip()
+                # 2xx/3xx, or an authentication wall (401/403) in front of the application; a 404 is Traefik's answer for NO route
+                if response.returncode == 0 and code.isdigit() and (200 <= int(code) < 400 or int(code) in {401, 403}):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RecoveryError("public root check failed")
+                time.sleep(2)
+
     def complete(self, *, artifacts: str = "not_applicable", migration: str = "completed",
                  checks: str = "completed", application: str | None = None,
                  health_check_passed: bool = False,
-                 satisfy_repair_ids: Iterable[str] = (), check_backend_http: bool = False) -> dict[str, Any]:
+                 satisfy_repair_ids: Iterable[str] = (), check_backend_http: bool = False,
+                 check_public_root: bool = False, after_rollback: bool = False) -> dict[str, Any]:
+        """Finish the transaction: start the previously running services and verify them.
+
+        `after_rollback` finishes a refresh that FAILED and whose last verified state was restored: the same start and health
+        verification runs, but no phase of the refresh is claimed, no repair is satisfied and the record says `refresh=failed`.
+        """
         if self.already_completed:
             return self.record
         if self.record is None:
             raise RecoveryError("no active recovery record")
-        if self.record.get("database") != "completed":
-            raise RecoveryError("database phase is not recorded as started")
-        if artifacts not in STATUSES["artifacts"] or migration != "completed" or checks != "completed":
-            raise RecoveryError("required recovery phase is incomplete")
-        if artifacts not in {"completed", "not_applicable"}:
-            raise RecoveryError("required artifacts are incomplete")
-        if self.record.get("migration") != "completed" or self.record.get("checks") != "completed":
-            raise RecoveryError("migration and health-check completion must be recorded")
+        if after_rollback:
+            artifacts, migration, checks = "not_attempted", "not_attempted", "not_attempted"
+            if (self.record.get("cutover") or {}).get("state") not in {"restored", "rolled_back"}:
+                raise RecoveryError("the last verified state has not been restored")
+        else:
+            if self.record.get("database") != "completed":
+                raise RecoveryError("database phase is not recorded as started")
+            if artifacts not in STATUSES["artifacts"] or migration != "completed" or checks != "completed":
+                raise RecoveryError("required recovery phase is incomplete")
+            if artifacts not in {"completed", "not_applicable"}:
+                raise RecoveryError("required artifacts are incomplete")
+            if self.record.get("migration") != "completed" or self.record.get("checks") != "completed":
+                raise RecoveryError("migration and health-check completion must be recorded")
         if application is not None and application != self.expected_final:
             raise RecoveryError("reported application state does not match the expected final state")
         final = "unknown"
         # Validate every requested repair before making the record successful.
         repairs_to_complete = []
-        repair_ids = sorted(set(self.record.get("repair_ids", []) + list(satisfy_repair_ids)))
+        repair_ids = [] if after_rollback else sorted(set(self.record.get("repair_ids", []) + list(satisfy_repair_ids)))
         for repair_id in repair_ids:
             target = Path(self.state_root) / "repairs" / f"{_safe_component(repair_id, 'repair id')}.json"
             item = _read_json(target)
@@ -1244,6 +1378,8 @@ class RecoveryTransaction:
                     if time.monotonic() >= deadline:
                         raise RecoveryError("required backend health check failed")
                     time.sleep(2)
+            if check_public_root:
+                self._verify_public_root(states)
             for service in start_services:
                 if service["restart_policy"] != "no":
                     self._docker("update", f"--restart={service['restart_policy']}", service["id"])
@@ -1261,6 +1397,8 @@ class RecoveryTransaction:
                 self.update_phase("application", "unhealthy")
                 raise RecoveryError("application container started during the recovery window")
             final = "stopped"
+        if after_rollback:
+            self.update_phase("database", "not_attempted")
         self.update_phase("artifacts", artifacts)
         self.update_phase("migration", migration)
         self.update_phase("checks", checks)
@@ -1268,6 +1406,14 @@ class RecoveryTransaction:
         if self.expected_final == "running" and final not in {"running", "healthy"}:
             raise RecoveryError("expected running application was not observed")
         self.record["satisfied_repair_ids"] = sorted({item[0].stem for item in repairs_to_complete})
+        self.record["refresh"] = "failed" if after_rollback else "succeeded"
+        self.record["rollback"] = "completed" if after_rollback else "not_needed"
+        cutover = self.record.get("cutover")
+        if isinstance(cutover, dict):
+            if not after_rollback and cutover.get("state") == "running":
+                cutover["state"] = "verified"
+            elif after_rollback:
+                cutover["state"] = "rolled_back"
         self.record.update(status="completed", updated_at=int(time.time()))
         _write_json(self.path, self.record)
         _write_startup_gate(self.project, "open", self.record, self.state_root)
@@ -1340,8 +1486,13 @@ def recovery_result(record: dict[str, Any]) -> str:
             "migration", "checks", "application", "observed_application",
             "expected_application", "requested_application", "origin_run_id", "origin_attempt", "repair_ids",
             "satisfied_repair_ids", "supersedes_operation_id", "primary_error",
-            "cleanup_error", "updated_at")
+            "cleanup_error", "updated_at", "refresh", "rollback")
     safe = {key: record.get(key) for key in keys}
+    cutover = record.get("cutover") if isinstance(record.get("cutover"), dict) else {}
+    safe["cutover_state"] = cutover.get("state") if cutover.get("state") in {
+        "running", "verified", "rolling_back", "restored", "rolled_back", "rollback_failed"} else None
+    safe["failed_phase"] = cutover.get("failed_phase") if isinstance(cutover.get("failed_phase"), str) and re.fullmatch(
+        r"[a-z_]{1,32}", cutover.get("failed_phase")) else None
     error_classes = {"RecoveryError", "RuntimeError", "SystemExit", "KeyboardInterrupt", "OSError",
                      "ValueError", "TimeoutError", "BrokenPipeError", "PermissionError",
                      "FileNotFoundError", "CalledProcessError", "TimeoutExpired", "InterruptedError"}

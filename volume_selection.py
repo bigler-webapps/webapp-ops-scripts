@@ -27,12 +27,20 @@ def load_config(path: Path = CONFIG_FILE) -> dict:
     for key in ("include", "exclude"):
         if not isinstance(cfg.get(key), list):
             raise ValueError(f"{path}: '{key}' must be a list")
+    exact = cfg.get("include_exact", [])
+    if not isinstance(exact, list) or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}", item)
+                                          for item in exact):
+        raise ValueError(f"{path}: 'include_exact' must be a list of exact volume names (no patterns)")
     if not isinstance(cfg.get("max_total_bytes_per_host"), int):
         raise ValueError(f"{path}: 'max_total_bytes_per_host' must be an integer")
     return cfg
 
 
 def is_declared(name: str, cfg: dict) -> bool:
+    """WM-INF-129: `include_exact` names ONE volume that is backed up although an exclude pattern matches it (exclusions otherwise
+    have precedence). Exact string equality, never a pattern; the running-mount requirement and the size gate still apply."""
+    if name in cfg.get("include_exact", []):
+        return True
     if any(fnmatch.fnmatchcase(name, pat) for pat in cfg["exclude"]):
         return False
     return any(fnmatch.fnmatchcase(name, pat) for pat in cfg["include"])

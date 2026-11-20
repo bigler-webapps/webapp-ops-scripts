@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import hashlib
 import argparse
 import re
 import subprocess
@@ -471,6 +472,150 @@ def import_database(tx, dump_file: Path, db_container_id: str, db_user: str, db_
     reset_database(db_container_id, db_user, db_name, tx=tx)
     stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name, tx=tx)
     tx.update_phase("database", "completed")
+
+
+# WM-INF-129: cutover with a recoverable copy. The live database is renamed, not dropped, so the last verified state exists until the
+# new one is verified; the state of the swap lives in Postgres and in the recovery record, so it survives an interruption.
+SAFE_DB_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$")
+# Free space kept beyond the estimated need; the estimate is a hypothesis (see require_capacity), not a measurement.
+CAPACITY_RESERVE_BYTES = 1 << 30
+
+
+class InsufficientCapacity(RuntimeError):
+    """The host cannot keep a recoverable copy next to the new state; the refresh is declined before anything changes."""
+
+
+def previous_database_name(db_name: str, operation_id: str) -> str:
+    digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:12]
+    return f"{db_name[:40]}__prev_{digest}"
+
+
+def _safe_db_name(name: str) -> str:
+    if not isinstance(name, str) or not SAFE_DB_NAME_RE.fullmatch(name):
+        raise RuntimeError("unsafe database name")
+    return name
+
+
+PREVIOUS_NAME_RE = re.compile(r"^.{1,40}__prev_[0-9a-f]{12}$")
+
+
+def _previous_name(previous: str, db_name: str | None = None) -> str:
+    """The name of the kept copy must be one `previous_database_name` produces; the recovery record is state on disk and is not trusted
+    to name an arbitrary database of the instance."""
+    _safe_db_name(previous)
+    if not PREVIOUS_NAME_RE.fullmatch(previous) or (db_name is not None and not previous.startswith(db_name[:40] + "__prev_")):
+        raise RuntimeError("unexpected previous database name")
+    return previous
+
+
+def _psql_output(tx, db_container_id: str, *args) -> str:
+    """psql output; with `tx=None` (the prepare phase: no transaction, nothing stopped) a plain read-only `docker exec`."""
+    if tx is None:
+        result = subprocess.run(["docker", "exec", db_container_id, "psql", *args], capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, timeout=60)
+        if result.returncode:
+            raise RuntimeError("database command failed")
+        return result.stdout
+    proc = tx.exec_psql(db_container_id, *args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    stdout, _ = proc.communicate()
+    if proc.returncode:
+        raise RuntimeError("database command failed")
+    return stdout
+
+
+def database_exists(tx, db_container_id: str, db_user: str, name: str) -> bool:
+    out = _psql_output(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-Atc",
+                       f"SELECT 1 FROM pg_database WHERE datname='{_safe_db_name(name)}';")
+    return out.strip() == "1"
+
+
+def database_size_bytes(tx, db_container_id: str, db_user: str, name: str) -> int:
+    out = _psql_output(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-Atc",
+                       f"SELECT pg_database_size('{_safe_db_name(name)}');")
+    return int(out.strip() or 0)
+
+
+def require_capacity(free_bytes: int, live_db_bytes: int, dump_bytes: int, reserve: int = CAPACITY_RESERVE_BYTES) -> None:
+    """Decline when the host cannot hold the live database AND the new one.
+
+    Hypothesis, not a measurement: the new database is not larger than max(live database, 2 x the UNCOMPRESSED dump text); the spooled
+    compressed dump is already on disk and is not counted again. A wrong estimate declines too much or too little; the reserve and the
+    first real run on the staging host are the check.
+    """
+    needed = max(live_db_bytes, 2 * dump_bytes) + reserve
+    if free_bytes < needed:
+        raise InsufficientCapacity("insufficient capacity to keep a recoverable copy")
+
+
+def _disconnect_database(tx, db_container_id: str, db_user: str, name: str) -> None:
+    _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+          f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{_safe_db_name(name)}' AND pid <> pg_backend_pid();")
+
+
+def swap_in_database(tx, dump_file: Path, db_container_id: str, db_user: str, db_name: str, previous: str) -> None:
+    """Keep the live database as `previous` and import the prepared dump into a fresh `db_name`."""
+    _safe_db_name(db_name)
+    _previous_name(previous, db_name)
+    tx.mark_database_started()
+    if database_exists(tx, db_container_id, db_user, previous):
+        raise RuntimeError("a previous database copy already exists for this operation")
+    had_live = database_exists(tx, db_container_id, db_user, db_name)
+    tx.update_cutover(database_previous=previous, database_had_live=had_live, database_swap="renaming")
+    if had_live:
+        _disconnect_database(tx, db_container_id, db_user, db_name)
+        _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+              f'ALTER DATABASE "{db_name}" RENAME TO "{previous}";')
+    tx.update_cutover(database_swap="renamed")
+    _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", f'CREATE DATABASE "{db_name}";')
+    tx.update_cutover(database_swap="created")
+    stream_restore_from_local_file(dump_file, db_container_id, db_user, db_name, tx=tx)
+    tx.update_phase("database", "completed")
+    tx.update_cutover(database_swap="imported")
+
+
+def rollback_database(tx, db_container_id: str, db_user: str, db_name: str) -> None:
+    """Idempotent: put the previous database back under its name. Safe to repeat after any interruption.
+
+    Raises when the swap had begun and the previous copy cannot be found: the last verified state cannot be shown, so the caller keeps
+    the startup gate blocked and reports the outstanding recovery.
+    """
+    cutover = tx.record.get("cutover") or {}
+    previous = cutover.get("database_previous")
+    swap = cutover.get("database_swap")
+    if not previous or not swap:
+        return
+    _safe_db_name(db_name)
+    _previous_name(previous, db_name)
+    if database_exists(tx, db_container_id, db_user, previous):
+        # Recorded BEFORE the first destructive step: if this rollback is interrupted after the rename back, the next one finds no
+        # previous copy but a live database and knows the restore was already done.
+        tx.update_cutover(database_swap="restoring")
+        if database_exists(tx, db_container_id, db_user, db_name):
+            _disconnect_database(tx, db_container_id, db_user, db_name)
+            _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+                  f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE);')
+        _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+              f'ALTER DATABASE "{previous}" RENAME TO "{db_name}";')
+    elif cutover.get("database_had_live") and swap == "restoring" and database_exists(tx, db_container_id, db_user, db_name):
+        pass  # the rename back completed before the interruption: the verified database is in place under its name
+    elif cutover.get("database_had_live") and swap in {"renamed", "created", "imported", "restoring"}:
+        raise RuntimeError("the previous database copy is missing; the last verified state cannot be shown")
+    elif not cutover.get("database_had_live") and swap in {"renamed", "created", "imported"}:
+        # No database existed before the cutover: whatever was created (the journal may lag the CREATE) is removed again.
+        if database_exists(tx, db_container_id, db_user, db_name):
+            _disconnect_database(tx, db_container_id, db_user, db_name)
+            _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+                  f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE);')
+    tx.update_cutover(database_swap="restored")
+
+
+def discard_previous_database(tx, db_container_id: str, db_user: str, previous: str, db_name: str | None = None) -> None:
+    """After a verified cutover: the old state is no longer needed. Bounded retention: nothing keeps it."""
+    _previous_name(previous, db_name)
+    _psql(tx, db_container_id, "-U", db_user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+          f'DROP DATABASE IF EXISTS "{previous}" WITH (FORCE);')
+    with contextlib.suppress(Exception):
+        tx.update_cutover(database_previous_dropped=True)
 
 
 def mode_in_place(args):

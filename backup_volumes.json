@@ -1,5 +1,5 @@
 {
-  "_comment": "OPS-BAK-1: production user-data Docker volumes that the nightly restic backup includes. A volume is backed up only if it matches an include pattern, matches no exclude pattern, and a RUNNING container mounts it. Databases are dumped separately (pg_dump). Secrets volumes are never listed here (secrets come from Proton via sync-secrets). max_total_bytes_per_host stops a host's run before any upload when its selected volumes exceed it (OPS-BAK-1 size gate: basis 13.6 GB + 25 percent).",
+  "_comment": "OPS-BAK-1: production user-data Docker volumes that the nightly restic backup includes. A volume is backed up only if it matches an include pattern, matches no exclude pattern, and a RUNNING container mounts it. WM-INF-129: include_exact names the one exact volume (HRAM production calibration outputs, backup-only, never transferred to staging) that is backed up although '*calibration_outputs*' excludes the others. Databases are dumped separately (pg_dump). Secrets volumes are never listed here (secrets come from Proton via sync-secrets). max_total_bytes_per_host stops a host's run before any upload when its selected volumes exceed it (OPS-BAK-1 size gate: basis 13.6 GB + 25 percent).",
   "include": [
     "*_production_media_volume",
     "*_production_excel_volume",
@@ -7,6 +7,9 @@
     "cockpit_production_open_webui_data",
     "innoservice_prod_media_volume",
     "jg-webapp_media_volume"
+  ],
+  "include_exact": [
+    "hram_production_calibration_outputs_volume"
   ],
   "exclude": [
     "photogallery_*",
