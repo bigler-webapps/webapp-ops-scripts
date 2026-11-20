@@ -51,7 +51,7 @@ class FakeDocker:
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
         tail = cmd[1:]
-        if tail[0] == "exec" and "curl" in tail:
+        if tail[0] == "exec" and "python" in tail:
             return subprocess.CompletedProcess(cmd, 0, "200", "")
         if "label=com.docker.compose.oneoff=True" in tail:
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -393,7 +393,9 @@ def test_controlled_start_for_health_checks_stays_inside_recovery_transaction(tm
         result = active.complete(artifacts="not_applicable", application="running", check_backend_http=True)
     assert result["status"] == "completed"
     assert result["application"] == "running"
-    assert any("curl" in command for command in docker.calls)
+    probes = [command for command in docker.calls if command[1:2] == ["exec"]]
+    assert probes and probes[0][3:5] == ["python", "-c"] and "curl" not in probes[0]
+    assert "/api/healthz" in probes[0][5] and "X-Forwarded-Proto" in probes[0][5]
 
 
 @pytest.mark.skipif(recovery.fcntl is None, reason="Linux flock is required")

@@ -1,6 +1,7 @@
 """WM-INF-129: cutover journal, rollback to the last verified state, failed-refresh recording and public-root verification."""
 import json
 import subprocess
+import sys
 
 import pytest
 
@@ -176,6 +177,45 @@ def test_public_root_hosts_come_only_from_the_applications_own_router_labels():
         {"Config": {"Labels": {"traefik.http.routers.bad name.rule": "Host(`bad.example.org`)"}}},
     ]
     assert recovery.public_root_hosts(items) == ["staging.example.org", "www.example.org"]
+
+
+def _serve(status, seen):
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("X-Forwarded-Proto")))
+            self.send_response(status)
+            self.send_header("Location", "https://elsewhere.invalid/")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("status", [200, 302, 503])
+def test_the_backend_probe_runs_with_the_interpreter_and_reports_the_status_without_curl(status):
+    seen = []
+    server = _serve(status, seen)
+    try:
+        source = recovery.BACKEND_HEALTH_PROBE.replace("'localhost', 8000", f"'127.0.0.1', {server.server_address[1]}")
+        result = subprocess.run([sys.executable, "-I", "-c", source], capture_output=True, text=True, timeout=30, check=False)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.returncode == 0 and result.stdout == str(status)
+    assert seen == [("/api/healthz", "https")]
+
+
+def test_the_backend_probe_fails_when_nothing_listens():
+    source = recovery.BACKEND_HEALTH_PROBE.replace("8000", "1")
+    result = subprocess.run([sys.executable, "-I", "-c", source], capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode != 0 and result.stdout == ""
 
 
 class CurlDocker(FakeDocker):

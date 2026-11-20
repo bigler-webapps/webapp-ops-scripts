@@ -56,6 +56,14 @@ CUTOVER_FIELDS = frozenset({
 })
 # Public-root verification needs the app's own Traefik router rule on the staging host; it is required for these apps only.
 PUBLIC_ROOT_CHECK_APPS = frozenset({"hram"})
+# The backend images carry Python but not necessarily curl (hram's does not), so the in-container probe uses
+# the interpreter. It prints the HTTP status without following redirects, like the curl call it replaces.
+BACKEND_HEALTH_PROBE = (
+    "import http.client\n"
+    "c = http.client.HTTPConnection('localhost', 8000, timeout=10)\n"
+    "c.request('GET', '/api/healthz', headers={'X-Forwarded-Proto': 'https'})\n"
+    "print(c.getresponse().status, end='')\n"
+)
 TRAEFIK_RULE_LABEL_RE = re.compile(r"^traefik\.http\.routers\.[A-Za-z0-9_-]{1,63}\.rule$")
 TRAEFIK_HOST_RE = re.compile(r"Host\(`([A-Za-z0-9][A-Za-z0-9.-]{0,252})`\)")
 
@@ -1367,8 +1375,7 @@ class RecoveryTransaction:
                     raise RecoveryError("required backend health target was not started")
                 deadline = time.monotonic() + 120
                 while True:
-                    command = [self.docker, "exec", backend["id"], "curl", "--max-time", "10", "-sS", "-o", "/dev/null",
-                               "-w", "%{http_code}", "-H", "X-Forwarded-Proto: https", "http://localhost:8000/api/healthz"]
+                    command = [self.docker, "exec", backend["id"], "python", "-c", BACKEND_HEALTH_PROBE]
                     options = {"capture_output": True, "text": True, "check": False}
                     if self.runner is subprocess.run:
                         options.update(pass_fds=(self.fd,), timeout=15)
