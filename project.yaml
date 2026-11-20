@@ -1,0 +1,6 @@
+# Scoped tests (python -I .claude/scripts/tests.py --repo webapp-ops-scripts). Linux-only suites (fcntl): runner wsl.
+project_name: "ops-scripts"
+tests:
+  ops-scripts:
+    runner: wsl
+    command: python3 -m pytest -q .
