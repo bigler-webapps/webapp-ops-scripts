@@ -1,0 +1,10 @@
+{
+  "exclude_table_data": {
+    "hram_production-db-1": {
+      "hram_db": [
+        "public.results_teachingreferralflow",
+        "public.results_teachingtreatmentoutcome"
+      ]
+    }
+  }
+}

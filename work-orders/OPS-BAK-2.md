@@ -22,7 +22,7 @@ Tier 3, infra lane: production backup on every production host.
 2. Dumps keep the file name pattern and the `.sql.gz` format; the change is the rsyncable compression mode. No change of dump format (plain SQL), no `pg_dump -Fc`.
 3. Order: first measure, then extend. The dump change lands first; the retention change lands only after the gain is measured over at least 7 nightly runs on every host and recorded in this WO.
 
-4. Added 2026-11-25 at the operator's request (from the WM-INF-138 canary, where the research-prod cycle ran over 33 minutes): the reproducible result tables of the HRAM production database are no longer backed up with data. Measured on research-prod, read-only, 2026-11-25: `hram_db` is 26 GB; `results_teachingreferralflow` is 21 GB and `results_teachingtreatmentoutcome` 0.98 GB; the audit log table is 1.9 GB and `runs_run` 0.4 GB, everything else is below 0.1 GB. The dump keeps the table definitions and skips the data of exactly the tables the operator confirms. Open before the build, both to be confirmed in this WO: (a) the exact table list (the two tables above, not the audit log, not `runs_run`); (b) the HRAM expert confirms the results can be recomputed after a restore and which restore tests expect those tables to be filled.
+4. Added 2026-11-25 at the operator's request (from the WM-INF-138 canary, where the research-prod cycle ran over 33 minutes): the reproducible result tables of the HRAM production database are no longer backed up with data. Measured on research-prod, read-only, 2026-11-25: `hram_db` is 26 GB; `results_teachingreferralflow` is 21 GB and `results_teachingtreatmentoutcome` 0.98 GB; the audit log table is 1.9 GB and `runs_run` 0.4 GB, everything else is below 0.1 GB. The dump keeps the table definitions and skips the data of exactly the tables the operator confirms. Confirmed by the operator in chat on 2026-11-25: (a) the exact table list is the two tables above (not the audit log, not `runs_run`); (b) the operator states that these results are reproducible, and the step was pulled forward for the WM-INF-138 canaries ("ja, mach die Aenderung"). Still to be recorded in the Completion: which restore tests, if any, expect those tables to be filled (the HRAM expert may add to this), and the measured dump size and cycle time before and after. The receivers keep the previous script commit until `webapp-management` moves its pin and installs `backup_db_policy.json` with it.
 
 ## Scope
 
@@ -52,7 +52,23 @@ Tier 3, infra lane: production backup on every production host.
 
 # B. Implementation map — addressed to the implementer
 
-To be filled by the Orchestrator.
+## B. Implementation map
+
+- `backup.py` (`perform_db_dumps`, the `pg_dump` argv at the `docker exec` call, `discover_docker_targets`) — the dump path; `backup_volumes.json` and `volume_selection.py` — the existing declared-policy pattern and its strict validation, read from the file next to the script.
+- Existing tests to follow: `test_backup.py`, `test_volume_backup.py`, `test_verify_backup.py`.
+- Consumers that must keep working with empty excluded tables: `verify_backup.py`, `restore.py`, `stack_recovery.py` (read only; no change planned).
+- Environment: the dump target is the container `hram_production-db-1`, database `hram_db`, on research-prod; the scripts run on the hosts as `deploy` with the standard library only; `webapp-management` installs the script files from a pinned commit (not part of this dispatch).
+- Scope of this first dispatch: the exclusion of the data of exactly two tables (see Part A decision 4); no compression change, no retention change.
+
+## Preamble
+
+> You are the dispatched implementer, not the Orchestrator. Your first tool action is
+> `codex-hook-canary-ws-gov-60`; continue on the expected denial and report unverified coverage
+> once if it is not denied. Read the nearest governance, memory and applicable skill.
+> Own only the paths in the dispatch state. Preserve parallel work. Edit source and tests and run
+> only your own new tests. Do not access hosts, credentials or the Tailnet console, dispatch jobs,
+> run reviewers or workers, edit the register, or write to git.
+> Report progress and end with `RESULT: DONE` or `RESULT: BLOCKED`, naming test evidence.
 
 # C. Orchestrator only — NOT ADDRESSED TO THE IMPLEMENTER
 

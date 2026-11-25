@@ -37,6 +37,7 @@ INFRA_PATHS_FILE = Path(os.environ.get("INFRA_PATHS_FILE", str(SCRIPTS_DIR / "in
 DUMP_DIR = Path("/srv/backups/db-dumps")
 PATHS_FILE = Path("/tmp/restic_backup_paths.txt")
 GENERATE_PATHS_SCRIPT = SCRIPTS_DIR / "generate_paths.py"
+DB_DUMP_POLICY_FILE = SCRIPTS_DIR / "backup_db_policy.json"
 VOLUMES_REPORT_FILE = Path("/srv/backups/.volumes_report.json")  # deploy-owned dir, not /tmp
 VOLUME_REPORT: Optional[List[dict]] = None
 
@@ -238,7 +239,44 @@ def utc_timestamp_str(now: Optional[datetime.datetime] = None) -> str:
     return now.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
 
 
+_TABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+
+
+def load_db_dump_policy() -> dict:
+    """Read and validate the complete dump policy before starting any dumps."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key: {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        with DB_DUMP_POLICY_FILE.open(encoding="utf-8") as policy_file:
+            policy = json.load(policy_file, object_pairs_hook=unique_object)
+        if not isinstance(policy, dict) or set(policy) != {"exclude_table_data"}:
+            raise ValueError("expected only an exclude_table_data object")
+        exclusions = policy["exclude_table_data"]
+        if not isinstance(exclusions, dict):
+            raise ValueError("exclude_table_data must be an object")
+        for container, databases in exclusions.items():
+            if not container or not isinstance(databases, dict) or not databases:
+                raise ValueError("each container must have a non-empty database object")
+            for database, tables in databases.items():
+                if not database or not isinstance(tables, list) or not tables:
+                    raise ValueError("each database must have a non-empty table list")
+                if any(not isinstance(table, str) or not _TABLE_NAME_RE.fullmatch(table) for table in tables):
+                    raise ValueError("table names must be exact schema-qualified identifiers")
+                if len(set(tables)) != len(tables):
+                    raise ValueError("duplicate table name")
+        return exclusions
+    except (OSError, UnicodeError, ValueError) as exc:
+        fail(f"Cannot load database dump policy '{DB_DUMP_POLICY_FILE}': {exc}")
+
+
 def perform_db_dumps() -> List[str]:
+    exclusions = load_db_dump_policy()
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=2)).timestamp()
     for f in DUMP_DIR.glob("*.sql.gz"):
         if f.stat().st_mtime < cutoff:
@@ -263,7 +301,12 @@ def perform_db_dumps() -> List[str]:
         tmpfile = DUMP_DIR / f"{safe_name}_{t['db']}_{t['id']}.sql.gz.tmp"
         outfile: Optional[Path] = None
 
-        docker_dump_cmd = DOCKER_CMD + ["exec", "-i", t["id"], "pg_dump", "-U", t["user"], t["db"]]
+        tables = exclusions.get(t["name"], {}).get(t["db"], [])
+        log(f"Dump exclusions: {t['name']} / {t['db']}: {', '.join(tables) if tables else 'none'}")
+        docker_dump_cmd = (
+            DOCKER_CMD + ["exec", "-i", t["id"], "pg_dump", "-U", t["user"]]
+            + [f"--exclude-table-data={table}" for table in tables] + [t["db"]]
+        )
 
         try:
             with tempfile.TemporaryFile() as errf:
