@@ -1,4 +1,4 @@
-"""WM-INF-129: the exact HRAM production calibration volume is backup-only; every other exclusion and the size gate stay.
+"""OPS-BAK-2: HRAM calibration outputs are excluded from backup; the exact-include mechanism and size gate stay.
 
 Run: pytest test_volume_backup_wm_inf_129.py
 """
@@ -18,15 +18,15 @@ CFG = vs.load_config()
 CALIBRATION = "hram_production_calibration_outputs_volume"
 
 
-def test_the_exact_calibration_volume_is_selected_although_calibration_outputs_are_excluded():
+def test_the_calibration_volume_is_excluded_from_the_shipped_policy():
     assert any(__import__("fnmatch").fnmatchcase(CALIBRATION, pattern) for pattern in CFG["exclude"]), "the exclusion still matches it"
-    assert vs.select_volumes({CALIBRATION, "hram_production_excel_volume"}, CFG) == sorted([CALIBRATION, "hram_production_excel_volume"])
+    assert vs.select_volumes({CALIBRATION, "hram_production_excel_volume"}, CFG) == ["hram_production_excel_volume"]
 
 
 def test_the_name_is_what_compose_creates_for_the_production_project_and_the_declared_volume_key():
     # hram's compose key is `calibration_outputs_volume`; the production Compose project is `hram_production`
     assert CALIBRATION == "hram_production_calibration_outputs_volume"
-    assert CFG["include_exact"] == [CALIBRATION]
+    assert CFG["include_exact"] == []
 
 
 @pytest.mark.parametrize("name", [
@@ -55,10 +55,10 @@ def test_an_unmounted_calibration_volume_is_not_selected_through_the_real_mount_
     mounted = vs.running_container_volumes(["docker"])
     assert CALIBRATION not in mounted and vs.select_volumes(mounted, CFG) == ["hram_production_excel_volume"]
     monkeypatch.setattr(vs.subprocess, "run", _fake_docker([["hram_production_excel_volume", CALIBRATION]]))
-    assert vs.select_volumes(vs.running_container_volumes(["docker"]), CFG) == sorted([CALIBRATION, "hram_production_excel_volume"])
+    assert vs.select_volumes(vs.running_container_volumes(["docker"]), CFG) == ["hram_production_excel_volume"]
 
 
-def test_the_calibration_volume_reaches_the_backup_path_list_and_report_through_the_generator(monkeypatch, tmp_path, capsys):
+def test_the_calibration_volume_is_absent_from_the_backup_path_list_and_report_through_the_generator(monkeypatch, tmp_path, capsys):
     import generate_paths as gp
     names = [CALIBRATION, "hram_production_pipeline_artifacts_volume", "hram_staging_calibration_outputs_volume"]
     monkeypatch.setattr(gp, "docker_cmd_prefix", lambda: ["docker"])
@@ -68,8 +68,8 @@ def test_the_calibration_volume_reaches_the_backup_path_list_and_report_through_
     report_file = tmp_path / "r.json"
     monkeypatch.setattr(sys, "argv", ["generate_paths.py", "--volumes-report", str(report_file)])
     assert gp.main() == 0
-    assert [v["name"] for v in json.loads(report_file.read_text())] == [CALIBRATION]
-    assert sorted(Path(p).parent.name for p in capsys.readouterr().out.split()) == [CALIBRATION]
+    assert [v["name"] for v in json.loads(report_file.read_text())] == []
+    assert capsys.readouterr().out.split() == []
 
 
 def test_hrams_compose_creates_exactly_that_production_volume_name():
@@ -124,6 +124,13 @@ def test_the_size_gate_stops_the_backup_before_any_dump_when_the_calibration_vol
 ])
 def test_the_other_production_artifact_exclusions_remain(name):
     assert vs.select_volumes({name}, CFG) == []
+
+
+def test_include_exact_overrides_exclusion_in_a_local_policy(tmp_path):
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"include": [], "exclude": ["*calibration_outputs*"],
+                                "include_exact": [CALIBRATION], "max_total_bytes_per_host": 1}), encoding="utf-8")
+    assert vs.select_volumes({CALIBRATION, "other_calibration_outputs_volume"}, vs.load_config(path)) == [CALIBRATION]
 
 
 def test_include_exact_accepts_names_only_never_patterns(tmp_path):

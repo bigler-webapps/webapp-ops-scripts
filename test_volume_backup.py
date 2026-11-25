@@ -28,6 +28,7 @@ ALL_NAMES = [
     "photogallery_production_media_volume",  # operator 2026-11-19: Photogallery is not backed up here
     "hram_production_pipeline_artifacts",
     "hram_production_calibration_outputs",
+    "hram_production_calibration_outputs_volume",
     "photogallery_production_postgres_data",
     "cockpit_production_hf_model_cache",
     "cockpit_production_secrets_volume",
