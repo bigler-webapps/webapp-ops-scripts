@@ -618,9 +618,27 @@ def discard_previous_database(tx, db_container_id: str, db_user: str, previous: 
         tx.update_cutover(database_previous_dropped=True)
 
 
+def check_remote_version(repository):
+    if not repository.lower().startswith(("b2:", "s3:")):
+        return True
+    try:
+        from restic_version import ResticTooOld, require_b2_version
+    except ImportError:
+        log("restic_version_floor: version check unavailable, refusing to open a B2 repository")
+        return False
+    try:
+        require_b2_version(RESTIC_BIN)
+    except ResticTooOld as exc:
+        log(str(exc))
+        return False
+    return True
+
+
 def mode_in_place(args):
     """Original same-server flow: restic snapshot -> staging DB on same host."""
     env = os.environ.copy()
+    if not check_remote_version(env.get("RESTIC_REPOSITORY", "")):
+        return 1
     if not env.get("RESTIC_REPOSITORY") or not env.get("RESTIC_PASSWORD"):
         log("ERROR: RESTIC_REPOSITORY / RESTIC_PASSWORD not set.")
         sys.exit(1)
@@ -688,6 +706,8 @@ def mode_in_place(args):
 def mode_dump_only(args):
     """Cross-server source side: dump a snapshot's .sql.gz to a local file + manifest, no DB ops."""
     env = os.environ.copy()
+    if not check_remote_version(env.get("RESTIC_REPOSITORY", "")):
+        return 1
     if not env.get("RESTIC_REPOSITORY") or not env.get("RESTIC_PASSWORD"):
         log("ERROR: RESTIC_REPOSITORY / RESTIC_PASSWORD not set.")
         sys.exit(1)

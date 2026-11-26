@@ -243,6 +243,17 @@ def main() -> int:
         print("[CRITICAL] RESTIC_REPO_B2 or RESTIC_PASSWORD missing.")
         return 1
 
+    try:
+        from restic_version import ResticTooOld, require_b2_version
+    except ImportError:
+        print("restic_version_floor: version check unavailable, refusing to open a B2 repository")
+        return 1
+    try:
+        require_b2_version(RESTIC_BIN)
+    except ResticTooOld as exc:
+        print(str(exc))
+        return 1
+
     print(f"-> Target Repository: {mask_repo(REPO_URL)}")
 
     env = build_restic_env()

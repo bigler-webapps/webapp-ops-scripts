@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import volume_selection as vs  # noqa: E402
+from restic_version import ResticTooOld, require_b2_version
 
 # --- Environment / Config ---
 RESTIC_REPO_LOCAL = os.environ.get("RESTIC_REPO_LOCAL")
@@ -48,6 +49,9 @@ LAST_B2_SNAPSHOT_ID_FILE = Path("/srv/backups/.last_b2_snapshot_id")
 LAST_RUN_DUMPS_FILE = Path("/srv/backups/.last_run_dumps")
 
 RESTIC_BIN = os.environ.get("RESTIC_BIN_OVERRIDE") or shutil.which("restic") or "/usr/bin/restic"
+# Enable only as the last landed change of WM-INF-147, after every B2 client
+# enforces the 0.16 floor on its trunk.
+B2_STALE_UNLOCK_ENABLED = False
 DEBUG = os.environ.get("DEBUG") == "1"
 
 # Retention policy
@@ -388,16 +392,22 @@ def run_restic(repo_url: Optional[str], repo_name: str, *, unlock_stale: bool = 
 
     env = {"RESTIC_REPOSITORY": repo_url}
 
+    if repo_name == "B2":
+        try:
+            require_b2_version(RESTIC_BIN)
+        except ResticTooOld as exc:
+            fail(str(exc))
+        if B2_STALE_UNLOCK_ENABLED:
+            run_cmd([RESTIC_BIN, "unlock"], env=env)
+
     restic_repo_ready(env, repo_name)
 
     # Clear stale locks left by an interrupted prior run (the 2026-07-12
     # contact-prod incident: a crashed restic left a lock that blocked
     # `forget --prune` on every subsequent daily run for days — backups kept
-    # succeeding but retention was stuck). Gated to unlock_stale callers only:
-    # `restic unlock` also reaps locks by AGE (>30 min), not just by dead PID, so
-    # it is safe ONLY on the strictly per-host local repo. The B2 repo is NOT
-    # auto-unlocked — restore-cross-server.yml can legitimately hold a lock on it
-    # from a different host, which an age-based unlock could wrongly reap.
+    # succeeding but retention was stuck). Since restic 0.16 live locks refresh
+    # every five minutes, plain unlock removes only stale locks; the B2 version
+    # floor protects that assumption once every client enforces it.
     # Best-effort: a real repo problem surfaces on the backup/forget step below.
     if unlock_stale:
         run_cmd([RESTIC_BIN, "unlock"], env=env)

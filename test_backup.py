@@ -6,6 +6,9 @@ Run: pytest test_backup.py
 import sys
 import types
 import io
+import os
+import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,6 +17,70 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 import backup  # noqa: E402
 import verify_backup as vb  # noqa: E402
+import restic_version  # noqa: E402
+
+
+def _b2_commands(monkeypatch, enabled=None):
+    calls = []
+    def version(cmd, **kwargs):
+        calls.append((cmd, None))
+        return types.SimpleNamespace(returncode=0, stdout="restic 0.16.4")
+    def run(cmd, env=None, **kwargs):
+        calls.append((cmd, env["RESTIC_REPOSITORY"]))
+        return True, "snapshot abc12345 saved", ""
+    restic_version.require_b2_version.cache_clear()
+    monkeypatch.setattr(subprocess, "run", version)
+    monkeypatch.setattr(backup, "run_cmd", run)
+    monkeypatch.setattr(backup, "RESTIC_PASSWORD", "x")
+    if enabled is not None:
+        monkeypatch.setattr(backup, "B2_STALE_UNLOCK_ENABLED", enabled)
+    monkeypatch.setattr(backup.os, "uname", lambda: types.SimpleNamespace(nodename="test"), raising=False)
+    backup.run_restic("s3:repo", "B2")
+    restic_version.require_b2_version.cache_clear()
+    assert calls[0] == ([backup.RESTIC_BIN, "version"], None)
+    first_repo = next(i for i, (cmd, repo) in enumerate(calls)
+                      if repo == "s3:repo" or "s3:repo" in cmd or "snapshots" in cmd or "init" in cmd)
+    assert first_repo > 0
+    assert all("--remove" + "-all" not in cmd for cmd, _ in calls)
+    return [cmd[1:] for cmd, repo in calls if repo == "s3:repo"]
+
+
+def test_b2_unlock_disabled_by_default(monkeypatch):
+    assert backup.B2_STALE_UNLOCK_ENABLED is False
+    assert ["unlock"] not in _b2_commands(monkeypatch)
+
+
+def test_b2_unlock_when_explicitly_enabled(monkeypatch):
+    commands = _b2_commands(monkeypatch, True)
+    assert commands[0] == ["unlock"]
+    assert commands.count(["unlock"]) == 1
+
+
+def test_b2_old_version_refused_before_repository_commands(monkeypatch, capsys):
+    calls = []
+    def version(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="restic 0.15.2")
+    restic_version.require_b2_version.cache_clear()
+    monkeypatch.setattr(subprocess, "run", version)
+    monkeypatch.setattr(backup, "run_cmd", lambda cmd, **kwargs: calls.append(cmd))
+    monkeypatch.setattr(backup, "RESTIC_PASSWORD", "x")
+    with pytest.raises(SystemExit):
+        backup.run_restic("s3:repo", "B2")
+    assert calls == [[backup.RESTIC_BIN, "version"]]
+    assert "restic_version_floor:" in capsys.readouterr().out
+
+
+def test_no_forbidden_unlock_argument_in_source():
+    root = Path(__file__).parent
+    forbidden = "--remove" + "-all"
+    argument = re.compile(r'''["']''' + re.escape(forbidden) + r'''["']''')
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__"} and not d.startswith("pytest-of-")]
+        for name in files:
+            path = Path(directory) / name
+            if path.suffix in {".py", ".sh", ".yml", ".yaml"}:
+                assert not argument.search(path.read_text(encoding="utf-8")), str(path)
 
 
 def _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, completion_times):
@@ -51,6 +118,7 @@ def _perform_mock_dumps(monkeypatch, tmp_path, targets, run_start, completion_ti
 
 def _run_verification(monkeypatch, files, snapshot_time):
     verified = []
+    monkeypatch.setattr(restic_version, "require_b2_version", lambda binary: None)
     monkeypatch.setattr(vb, "REPO_URL", "s3:example/repo")
     monkeypatch.setattr(vb, "REPO_PWD", "password")
     monkeypatch.setattr(vb, "VERIFY_ALL_SQL_GZ", False)
@@ -150,6 +218,7 @@ def test_run_restic_preserves_snapshot_id_when_retention_fails(monkeypatch):
         return True, "", ""  # snapshots (repo-ready check)
 
     monkeypatch.setattr(backup, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(backup, "require_b2_version", lambda binary: None)
     monkeypatch.setattr(backup, "RESTIC_PASSWORD", "x")
     monkeypatch.setattr(backup.os, "uname", lambda: types.SimpleNamespace(nodename="test-host"), raising=False)
 

@@ -315,6 +315,21 @@ def restore_flow(tmp_path, monkeypatch):
     return events, instances, active, args
 
 
+def test_import_only_without_restic_version(restore_flow, monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+    def blocked(name, *args, **kwargs):
+        if name == "restic_version":
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    events, _, _, args = restore_flow
+    assert restore.mode_import_only(args) == 0
+    assert "finalize" in events
+
+
 def test_import_holds_transaction_through_migration_checks_and_finalization(restore_flow):
     events, instances, active, args = restore_flow
     assert restore.mode_import_only(args) == 0
