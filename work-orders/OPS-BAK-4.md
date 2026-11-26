@@ -29,3 +29,12 @@ In this repository: research-prod's backup and every script here that opens its 
 ## C. Orchestrator only
 
 Coordinate with WM-INF-146.
+
+## Completion (2026-11-26, Orchestrator)
+
+No script change needed; the Envelope is met by the existing design. Evidence (read-only inspection of this repository at e30a951 and of webapp-management at f9687a83):
+- No production repository is hard-coded in `backup.py`, `verify_backup.py`, `restore.py`, `restic_version.py` or `stack_recovery.py`; every repository URL comes from the delivered `RESTIC_REPO_B2` / `RESTIC_REPOSITORY` (the `s3:`/`b2:` strings are test fixtures). research-prod therefore uses the new repository as soon as its credentials point there; main-prod's inputs are untouched.
+- A missing or mismatched repository is refused before restic opens anything by the receiver (`ops_backup_receiver/files/receiver.py` `repository_approved`, reason `repository_policy_mismatch`), pinned by `agent-applies.json` and `test_ops_backup_cutover.py` (WM-INF-146 backup chunk, 052186d7).
+- Old snapshots: restore workflows choose the shared repository through `research_repository=shared` (WM-INF-146, 679a1747 and 6f92bd07); `restore.py` takes whatever repository the job delivers.
+- Known behaviour, not changed: `backup.py` skips B2 when no URL is delivered at all (`run_restic` "SKIP (no repo url)"); for research-prod this cannot occur through the receiver because the empty value fails the pin.
+Review: none (no diff). Part B: accurate. Acceptance: with WM-INF-146 (first research-prod snapshot in the new repository, drill with `shared` on an old snapshot).
