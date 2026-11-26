@@ -25,6 +25,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# The receiver runs this script with `python -I`, which leaves the script
+# directory off sys.path; the sibling restic_version module must still load.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 # --- Config ---
 REPO_URL = os.environ.get("RESTIC_REPO_B2")
 REPO_PWD = os.environ.get("RESTIC_PASSWORD")

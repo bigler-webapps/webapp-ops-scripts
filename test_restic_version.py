@@ -1,6 +1,8 @@
 import builtins
 import runpy
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -110,6 +112,17 @@ def test_restore_local_repositories_bypass_the_floor(monkeypatch, repository):
         raise AssertionError("version check must not run for a local repository")
     monkeypatch.setattr(subprocess, "run", fail)
     assert restore.check_remote_version(repository) is True
+
+
+def test_verify_finds_the_floor_module_under_isolated_mode(tmp_path):
+    env = {"RESTIC_REPO_B2": "b2:example:repo", "RESTIC_PASSWORD": "password", "B2_KEY_ID": "id",
+           "B2_APP_KEY": "key", "RESTIC_BIN_OVERRIDE": str(tmp_path / "no-such-restic")}
+    result = subprocess.run([sys.executable, "-I", str(Path(verify_backup.__file__).resolve())],
+                            capture_output=True, text=True, env=env, cwd=str(tmp_path), check=False)
+    output = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "cannot determine restic version" in output
+    assert "version check unavailable" not in output
 
 
 def test_verify_missing_floor_module_refuses(monkeypatch, capsys):
