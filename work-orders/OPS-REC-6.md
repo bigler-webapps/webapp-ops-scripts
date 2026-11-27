@@ -28,3 +28,7 @@ Coordinate reviews, evidence, delivery and managed-server applies with HRAM-CHT-
 ## Gate record
 
 Gate #1 approved by the operator 2026-11-27 (resolve the activation blockers; after activation recover forward with compatible code and require a separate approval plus verified matching database restoration for old-image rollback).
+
+## Completion
+
+2026-11-27: Configured implementer `codex/gpt-6.1-terra` added only an inert `begin_hram_cutover` interface that rejects all activation before state changes. Three selected tests passed through `tests.py`; this is not full scope evidence. The durable barrier and compatibility fence are not implemented. The remaining prerequisites are a trusted complete inventory of authorization writers, verified release identity and enforcement across deploy, automatic restart, recovery and restore. The implementer's canary command was unavailable in the restricted target root, so hook coverage was unverified. A read-only attempt to inventory staging with `ssh staging` plus a Docker command failed with `Cannot execute command-line and remote command.` No managed-server change or activation occurred. Part B: errors: the trusted inventory and cross-path compatibility integration remain unresolved.
