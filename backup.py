@@ -441,6 +441,8 @@ def run_restic(repo_url: Optional[str], repo_name: str, *, unlock_stale: bool = 
         "--quiet",
         "forget",
         "--prune",
+        "--tag",
+        "daily",
         "--keep-daily",
         KEEP_DAILY,
         "--keep-weekly",
@@ -525,6 +527,15 @@ def main() -> None:
 
     if not ok_local or not ok_b2:
         fail("Restic backup failed for one or more repositories.")
+
+    if os.uname().nodename == "research-prod" and RESTIC_REPO_B2:
+        try:
+            import staging_set_snapshot as staging_set
+        except ImportError:
+            code = "snapshot_failure"
+        else:
+            code = staging_set.backup(DOCKER_CMD, RESTIC_BIN, RESTIC_REPO_B2, os.uname().nodename)
+        log(f"STAGING_SET={code}")
 
     log(
         f"VOLUMES_BACKED_UP={len(VOLUME_REPORT or [])} "

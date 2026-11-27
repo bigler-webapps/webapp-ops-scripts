@@ -6,6 +6,7 @@ requirement. Run: pytest test_verify_backup.py
 
 import sys
 import types
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,6 +15,36 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 import backup  # noqa: E402
 import verify_backup as vb  # noqa: E402
+
+
+def test_daily_listing_selects_newest_daily_snapshot(monkeypatch):
+    snapshots = [
+        {"id": "old", "time": "2026-01-01T00:00:00Z", "tags": ["daily"]},
+        {"id": "daily", "time": "2026-01-02T00:00:00Z", "tags": ["daily"]},
+        {"id": "staging", "time": "2026-01-03T00:00:00Z", "tags": ["hram-staging-set"]},
+    ]
+    def fake_run(cmd, **kwargs):
+        assert cmd == [vb.RESTIC_BIN, "snapshots", "--host", "research-prod", "--tag", "daily", "--json"]
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps([s for s in snapshots if "daily" in s["tags"]]))
+
+    monkeypatch.setattr(vb.subprocess, "run", fake_run)
+    assert vb.get_target_snapshot({}, "research-prod", None)[0] == "daily"
+
+
+@pytest.mark.parametrize("tags,refused", [(["hram-staging-set"], True), (["hram-staging-set", "daily"], False), ([], False)])
+def test_explicit_snapshot_is_unfiltered_and_rejects_staging_only(monkeypatch, tags, refused):
+    def fake_run(cmd, **kwargs):
+        assert cmd == [vb.RESTIC_BIN, "snapshots", "--host", "research-prod", "--json"]
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps([
+            {"id": "explicit123", "time": "2026-01-01T00:00:00Z", "tags": tags},
+        ]))
+
+    monkeypatch.setattr(vb.subprocess, "run", fake_run)
+    if refused:
+        with pytest.raises(RuntimeError, match="staging-set.*refusing"):
+            vb.get_target_snapshot({}, "research-prod", "explicit")
+    else:
+        assert vb.get_target_snapshot({}, "research-prod", "explicit")[0] == "explicit123"
 
 
 def test_snapshot_ordering_across_mixed_offsets_uses_parsed_instant():

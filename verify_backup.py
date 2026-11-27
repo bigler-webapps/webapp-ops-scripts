@@ -159,6 +159,9 @@ def choose_snapshot(snapshots: List[Dict], explicit_id: Optional[str] = None) ->
                 f"{len(matches)} snapshots ambiguously — refusing to guess."
             )
         if matches:
+            tags = matches[0].get("tags") or []
+            if "hram-staging-set" in tags and "daily" not in tags:
+                raise RuntimeError(f"Snapshot '{explicit_id}' is a staging-set snapshot, not a daily backup; refusing to use it.")
             return matches[0]
         raise RuntimeError(
             f"Snapshot '{explicit_id}' (from {LAST_B2_SNAPSHOT_ID_FILE}) not found "
@@ -171,13 +174,16 @@ def choose_snapshot(snapshots: List[Dict], explicit_id: Optional[str] = None) ->
     return max(snapshots, key=lambda s: _parse_snapshot_instant(s["time"]))
 
 
-def list_host_snapshots(env: dict, host: str) -> List[Dict]:
+def list_host_snapshots(env: dict, host: str, explicit_id: Optional[str] = None) -> List[Dict]:
     """
     Lists snapshots restricted to THIS host (backup.py tags every backup with
     `--host <nodename>`). Constraining discovery to the host is what makes the
     ad-hoc fallback path safe on a shared multi-target B2 repository.
     """
-    cmd = [RESTIC_BIN, "snapshots", "--host", host, "--json"]
+    cmd = [RESTIC_BIN, "snapshots", "--host", host]
+    if not explicit_id:
+        cmd += ["--tag", "daily"]
+    cmd.append("--json")
     res = subprocess.run(cmd, env=env, capture_output=True, text=True)
 
     if res.returncode != 0:
@@ -187,7 +193,7 @@ def list_host_snapshots(env: dict, host: str) -> List[Dict]:
 
 
 def get_target_snapshot(env: dict, host: str, explicit_id: Optional[str]) -> tuple[str, str]:
-    snapshots = list_host_snapshots(env, host)
+    snapshots = list_host_snapshots(env, host, explicit_id)
     chosen = choose_snapshot(snapshots, explicit_id)
     return chosen["id"], chosen["time"]
 

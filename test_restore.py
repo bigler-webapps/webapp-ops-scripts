@@ -21,6 +21,36 @@ def completed_process(stdout=""):
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
 
+def test_latest_snapshot_filters_daily_before_selecting_across_groups(monkeypatch):
+    snapshots = [
+        {"id": "old", "time": "2026-01-01T00:00:00Z", "tags": ["daily"]},
+        {"id": "daily", "time": "2026-01-02T00:00:00Z", "tags": ["daily"]},
+        {"id": "staging", "time": "2026-01-03T00:00:00Z", "tags": ["hram-staging-set"]},
+    ]
+    def fake_run_cmd(cmd, env=None):
+        assert cmd == [restore.RESTIC_BIN, "snapshots", "--latest", "1", "--tag", "daily", "--json"]
+        return completed_process(json.dumps([s for s in snapshots if "daily" in s["tags"]]))
+
+    monkeypatch.setattr(restore, "run_cmd", fake_run_cmd)
+    assert restore.get_latest_snapshot({})[0] == "daily"
+
+
+@pytest.mark.parametrize("tags,refused", [(["hram-staging-set"], True), (["hram-staging-set", "daily"], False), ([], False)])
+def test_explicit_snapshot_is_unfiltered_and_rejects_staging_only(monkeypatch, capsys, tags, refused):
+    def fake_run_cmd(cmd, env=None):
+        assert cmd == [restore.RESTIC_BIN, "snapshots", "explicit", "--json"]
+        return completed_process(json.dumps([{"id": "explicit123", "time": "2026-01-01T00:00:00Z", "tags": tags}]))
+
+    monkeypatch.setattr(restore, "run_cmd", fake_run_cmd)
+    if refused:
+        with pytest.raises(SystemExit) as exc:
+            restore.resolve_snapshot({}, "explicit")
+        assert exc.value.code == 1
+        assert "staging-set" in capsys.readouterr().out
+    else:
+        assert restore.resolve_snapshot({}, "explicit")[0] == "explicit123"
+
+
 def test_import_database_is_db_only_and_records_completion(tmp_path, monkeypatch):
     class Tx:
         def __init__(self):

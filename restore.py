@@ -220,7 +220,7 @@ def get_db_credentials(container_id: str):
 
 
 def get_latest_snapshot(env: dict):
-    snaps = json.loads(run_cmd([RESTIC_BIN, "snapshots", "--latest", "1", "--json"], env=env).stdout)
+    snaps = json.loads(run_cmd([RESTIC_BIN, "snapshots", "--latest", "1", "--tag", "daily", "--json"], env=env).stdout)
     if not snaps:
         log("ERROR: No snapshots found.")
         sys.exit(1)
@@ -233,6 +233,10 @@ def get_snapshot_by_id(env: dict, snapshot_id: str):
     snaps = json.loads(res.stdout)
     if not snaps:
         log(f"ERROR: Snapshot '{snapshot_id}' not found.")
+        sys.exit(1)
+    tags = snaps[0].get("tags") or []
+    if "hram-staging-set" in tags and "daily" not in tags:
+        log(f"ERROR: Snapshot '{snapshot_id}' is a staging-set snapshot, not a daily backup; refusing to restore it.")
         sys.exit(1)
     return snaps[0]["id"], snaps[0]["time"]
 
